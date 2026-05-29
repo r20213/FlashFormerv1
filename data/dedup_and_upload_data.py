@@ -27,8 +27,8 @@ except ImportError:
     raise ImportError("Could not import DataConfig from config.py. Ensure config.py exists in the current directory.")
 
 # --- LOCAL DEPLOYMENT TUNING PARAMETERS ---
-TARGET_TOKENS = 35_000_000_000     # 35 Billion tokens total
-SHARD_SIZE_TOKENS = 100_000_000   # 100M tokens per shard (~350 files total)
+TARGET_TOKENS = 20_000_000_000     # 20 Billion tokens total
+SHARD_SIZE_TOKENS = 100_000_000   # 100M tokens per shard (~200 files total)
 DEDUP_WINDOW_SIZE = 100_000       # Tracks last 100k document hashes seamlessly
 
 def parse_args():
