@@ -33,10 +33,8 @@ from modal.mount import Mount
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .pip_install("packaging", "torch==2.4.0", "torchvision")
     .pip_install(
-        # Core deep learning
-        "torch==2.4.0",
-        "torchvision",
         # Flash Attention (pre-built wheel for CUDA 12.1 / torch 2.4)
         "flash-attn==2.6.3",
         # Data pipeline
