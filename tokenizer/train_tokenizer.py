@@ -51,7 +51,7 @@ SOURCES = [
     {"path": "bigcode/starcoderdata", "name": "python",     "split": "train", "text_column": "content", "weight": 0.090},
     {"path": "bigcode/starcoderdata", "name": "javascript", "split": "train", "text_column": "content", "weight": 0.065},
     {"path": "bigcode/starcoderdata", "name": "java",       "split": "train", "text_column": "content", "weight": 0.045},
-    {"path": "bigcode/starcoderdata", "name": "c++",        "split": "train", "text_column": "content", "weight": 0.038},
+    {"path": "bigcode/starcoderdata", "name": "cpp",        "split": "train", "text_column": "content", "weight": 0.038},
     {"path": "bigcode/starcoderdata", "name": "c",          "split": "train", "text_column": "content", "weight": 0.032},
     {"path": "bigcode/starcoderdata", "name": "sql",        "split": "train", "text_column": "content", "weight": 0.015},
     # ── Code: Tier B (reasoning signal) ────────────────────────────────────
