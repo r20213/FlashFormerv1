@@ -30,14 +30,21 @@ from modal.mount import Mount
 # ---------------------------------------------------------------------------
 # Modal image — everything the training job needs
 # ---------------------------------------------------------------------------
-
+# Exact matching wheel URL for flash-attn 2.6.3, torch 2.4, python 3.11
+# Fully verified wheel URL mapping to your environment
+FLASH_ATTN_WHEEL = (
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/"
+    "flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
     .pip_install("packaging", "torch==2.4.0", "torchvision")
+    # Stage 2: Install Flash Attention using the pre-compiled wheel
+    .pip_install(FLASH_ATTN_WHEEL)
     .pip_install(
-        # Flash Attention (pre-built wheel for CUDA 12.1 / torch 2.4)
-        "flash-attn==2.6.3",
+        # # Flash Attention (pre-built wheel for CUDA 12.1 / torch 2.4)
+        # "flash-attn==2.6.3",
         # Data pipeline
         "datasets==2.20.0",
         "sentencepiece==0.2.0",
