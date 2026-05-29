@@ -160,7 +160,7 @@ class DataConfig:
         # C++ — low-level + OOP patterns; distinct from C in abstraction style.
         {
             "path": "bigcode/starcoderdata",
-            "name": "c++",
+            "name": "cpp",
             "split": "train",
             "text_column": "content",
             "weight": 0.038,
