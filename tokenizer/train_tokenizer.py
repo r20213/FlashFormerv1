@@ -140,7 +140,6 @@ def stream_source(
     kwargs = {
         "streaming": True,
         "split": source["split"],
-        "trust_remote_code": True,
         "token": hf_token,
     }
     if source["path"] == "bigcode/starcoderdata":
