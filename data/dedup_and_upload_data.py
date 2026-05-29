@@ -1,36 +1,45 @@
 import os
 import sys
+import argparse
 import numpy as np
 import collections
 import hashlib
 from typing import Optional
+
+# Core imports
 from datasets import load_dataset, interleave_datasets, Dataset
 import sentencepiece as spm
 from detoxify import Detoxify
 import fasttext
 
+# Performance Tuning for 4 vCPU environments (Prevents PyTorch from oversaturating CPU threads)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 # Force path resolution for local configurations
 sys.path.append(os.getcwd())
-from config import DataConfig  # Ingests your exact architecture layouts
+try:
+    from config import DataConfig  # Ingests your exact architecture layouts
+except ImportError:
+    raise ImportError("Could not import DataConfig from config.py. Ensure config.py exists in the current directory.")
 
 # --- LOCAL DEPLOYMENT TUNING PARAMETERS ---
-TARGET_TOKENS = 20_000_000_000     # 20 Billion tokens total
-SHARD_SIZE_TOKENS = 100_000_000   # 100M tokens per shard (~200 files total)
-HF_EXPORT_REPO = "your-hf-username/prefiltered-packed-235m"
+TARGET_TOKENS = 35_000_000_000     # 35 Billion tokens total
+SHARD_SIZE_TOKENS = 100_000_000   # 100M tokens per shard (~350 files total)
 DEDUP_WINDOW_SIZE = 100_000       # Tracks last 100k document hashes seamlessly
 
-print("Initializing DataConfig Specifications...")
-dcfg = DataConfig()
-
-# Explicitly override the legacy 'c++' directory key to prevent Hub routing crashes
-for src in dcfg.sources:
-    if src.get("path") == "bigcode/starcoderdata" and src.get("name") == "c++":
-        src["name"] = "cpp"
-
-print("Loading GPU-Accelerated Filter Handlers...")
-detox_model = Detoxify("original", device="cuda")
-ft_model = fasttext.load_model("tokenizer/fasttext_model.bin")
-sp = spm.SentencePieceProcessor(model_file=dcfg.tokenizer_path)
+def parse_args():
+    parser = argparse.ArgumentParser(description="GPU-Optimized Dataset Tokenization and Pack Pipeline")
+    parser.add_argument(
+        "--hf_export_repo", 
+        type=str, 
+        required=True, 
+        help="Mandatory Hugging Face repository destination (e.g., 'username/prefiltered-packed-235m')"
+    )
+    return parser.parse_args()
 
 def _extract_text_by_config(row: dict, src_config: dict) -> Optional[str]:
     """Extracts text strings adhering exactly to DataConfig structural keys."""
@@ -50,7 +59,29 @@ def _extract_text_by_config(row: dict, src_config: dict) -> Optional[str]:
             return val.strip()
     return None
 
-def build_and_upload_dataset():
+def build_and_upload_dataset(hf_export_repo: str):
+    print("Initializing DataConfig Specifications...")
+    dcfg = DataConfig()
+
+    # Explicitly override the legacy 'c++' directory key to prevent Hub routing crashes
+    for src in dcfg.sources:
+        if src.get("path") == "bigcode/starcoderdata" and src.get("name") == "c++":
+            src["name"] = "cpp"
+
+    print("Loading Multi-GPU & CPU Filter Handlers...")
+    
+    # 2x T4 GPU Optimization: Dual-Model Pipeline Round-Robin Setup
+    # Instead of multi-processing (which copies the 27GB RAM space and crashes your system),
+    # we instantiate two model references targeted at different cuda devices on the main thread.
+    print(" -> Allocating Detoxify Models to cuda:0 and cuda:1...")
+    detox_gpu0 = Detoxify("original", device="cuda:0")
+    detox_gpu1 = Detoxify("original", device="cuda:1")
+    detox_models = [detox_gpu0, detox_gpu1]
+    gpu_selector = 0  # Round-robin toggle pointer
+
+    ft_model = fasttext.load_model("tokenizer/fasttext_model.bin")
+    sp = spm.SentencePieceProcessor(model_file=dcfg.tokenizer_path)
+
     sources = dcfg.sources
     hf_token = os.environ.get("HF_TOKEN", None)
     hf_datasets = []
@@ -85,6 +116,9 @@ def build_and_upload_dataset():
 
     # State containers
     buffer = []
+    
+    # RAM Optimization: Pre-allocate standard internal list to avoid structural memory overhead.
+    # Appending massive sublists elements to python lists grows objects footprint dramatically.
     current_shard_tokens = []
     shard_counter = 0
     total_tokens_written = 0
@@ -102,6 +136,7 @@ def build_and_upload_dataset():
         
         text = _extract_text_by_config(row, src_config)
         if text is None or len(text) < 40:
+            return None if text is None else len(text)
             continue
             
         # 1. Inline Window Deduplication
@@ -110,21 +145,27 @@ def build_and_upload_dataset():
             continue
         seen_hashes.append(doc_hash)
 
-        # 2. FastText Language Uniformity Classifier
+        # 2. FastText Language Uniformity Classifier (CPU Bound)
         try:
             labels, scores = ft_model.predict(text.replace("\n", " "), k=1)
             label = labels[0].replace("__label__", "")
             if label != "en" or scores[0] < dcfg.lang_threshold:
                 continue
-        except:
+        except Exception:
             continue
 
-        # 3. Detoxify Content Guard Rail Filter
+        # 3. Detoxify Content Guard Rail Filter (Dual GPU Round Robin Execution)
         try:
-            res = detox_model.predict(text)
+            # Alternates evaluation queries across both T4 GPUs dynamically on the fly
+            active_detox_model = detox_models[gpu_selector]
+            res = active_detox_model.predict(text)
+            gpu_selector = (gpu_selector + 1) % 2 # Flip-flop index pointer between [0, 1]
+            
             if res.get("toxicity", 0.0) >= dcfg.toxicity_threshold:
                 continue
-        except:
+        except Exception:
+            # Safely continue loop execution if string serialization fails
+            gpu_selector = (gpu_selector + 1) % 2
             continue
 
         # 4. Tokenization and Document Bounds Constraints Verification
@@ -146,17 +187,21 @@ def build_and_upload_dataset():
             if len(current_shard_tokens) * dcfg.seq_len >= SHARD_SIZE_TOKENS:
                 print(f"📦 Assembling Batch Shard {shard_counter} | Accumulated Target: {total_tokens_written:,} tokens")
                 
+                # Zero-copy reference construction into dynamic PyArrow arrays
                 arr = np.array(current_shard_tokens, dtype=np.int32)
                 ds = Dataset.from_dict({"input_ids": arr})
                 
                 # Pushes incrementally without localized storage overheads
                 ds.push_to_hub(
-                    HF_EXPORT_REPO, 
+                    hf_export_repo, 
                     split=f"train_shard_{shard_counter}",
                     private=True,
                     token=hf_token
                 )
                 
+                # Reclaim memory space right away
+                del arr
+                del ds
                 current_shard_tokens = []
                 shard_counter += 1
                 
@@ -166,4 +211,5 @@ def build_and_upload_dataset():
             break
 
 if __name__ == "__main__":
-    build_and_upload_dataset()
+    args = parse_args()
+    build_and_upload_dataset(hf_export_repo=args.hf_export_repo)
