@@ -33,6 +33,7 @@ from modal.mount import Mount
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
     .pip_install("packaging", "torch==2.4.0", "torchvision")
     .pip_install(
         # Flash Attention (pre-built wheel for CUDA 12.1 / torch 2.4)
