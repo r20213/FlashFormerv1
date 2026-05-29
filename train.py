@@ -26,7 +26,7 @@ import shutil
 from pathlib import Path
 import torch
 import modal
-
+from modal.mount import Mount
 # ---------------------------------------------------------------------------
 # Modal image — everything the training job needs
 # ---------------------------------------------------------------------------
@@ -330,10 +330,10 @@ def _sample_prompts(model, cfg, device):
     secrets=[modal.Secret.from_name("pretrain-secrets")],
     mounts=[
         # Mount the local model/ and data/ packages so Modal can import them
-        modal.Mount.from_local_dir("model",     remote_path="/root/model"),
-        modal.Mount.from_local_dir("data",      remote_path="/root/data"),
-        modal.Mount.from_local_file("config.py", remote_path="/root/config.py"),
-        modal.Mount.from_local_file("tokenizer/spm.model",
+        Mount.from_local_dir("model",     remote_path="/root/model"),
+        Mount.from_local_dir("data",      remote_path="/root/data"),
+        Mount.from_local_file("config.py", remote_path="/root/config.py"),
+        Mount.from_local_file("tokenizer/spm.model",
                                     remote_path="/root/tokenizer/spm.model"),
     ],
 )
