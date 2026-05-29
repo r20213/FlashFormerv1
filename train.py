@@ -53,7 +53,7 @@ image = (
         "detoxify==0.5.2",
         "fasttext-wheel==0.9.2",
         # Logging
-        "wandb==0.17.4",
+        "wandb==0.22.3",
         # Misc
         "numpy",
         "tqdm",
