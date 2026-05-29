@@ -8,7 +8,7 @@ from typing import Optional
 from pathlib import Path
 
 # Core imports
-from datasets import load_dataset, interleave_datasets, Dataset
+from datasets import load_dataset, interleave_datasets, Dataset, Features, Value
 import sentencepiece as spm
 
 # Performance Tuning for 4 vCPU environments
@@ -84,12 +84,17 @@ def build_and_upload_dataset(hf_export_repo: str):
     hf_token = os.environ.get("HF_TOKEN", None)
     hf_datasets = []
     
+    # Define rigid schema definitions upfront to eliminate PyArrow alignment checks completely
+    base_features = Features({"content": Value("string"), "__resolved_source__": Value("string")})
+    math_features = Features({"text": Value("string"), "__resolved_source__": Value("string")})
+    prose_features = Features({"content": Value("string"), "__resolved_source__": Value("string")})
+    sft_features = Features({"instruction": Value("string"), "response": Value("string"), "__resolved_source__": Value("string")})
+
     print("Binding streaming generators to HuggingFace Hub repositories...")
     for idx, src in enumerate(sources):
         kwargs = {
             "streaming": True,
             "split": src["split"],
-            "trust_remote_code": True,
             "token": hf_token,
         }
         if src["path"] == "bigcode/starcoderdata":
@@ -99,25 +104,19 @@ def build_and_upload_dataset(hf_export_repo: str):
             
         ds = load_dataset(src["path"], **kwargs)
         
-        # Resolve target parsing columns for this stream
-        text_col = "content" if src["path"] == "bigcode/starcoderdata" else src.get("text_column")
+        # Inject tracking keys upfront
         source_key = f"{src['path']}:{src.get('name', '')}"
-        
-        # 1. Map to resolve the source key tracker
         ds = ds.map(lambda r, sk=source_key: {"__resolved_source__": sk})
         
-        # 2. Strict Column Selection: Isolates structural keys and drops dirty meta configurations
-        columns_to_keep = ["__resolved_source__"]
-        if text_col:
-            columns_to_keep.append(text_col)
-        if src["path"] == "openbmb/UltraInteract_sft":
-            columns_to_keep.extend(["instruction", "response"])
-            
-        # Extract features safely to prune conflicting float/int types
-        all_cols = list(ds.features.keys()) if hasattr(ds, "features") and ds.features else []
-        if all_cols:
-            cols_to_remove = [c for c in all_cols if c not in columns_to_keep]
-            ds = ds.remove_columns(cols_to_remove)
+        # Cast the stream directly onto isolated schema layouts, dumping the broken star metadata
+        if src["path"] == "bigcode/starcoderdata":
+            ds = ds.cast(base_features)
+        elif src["path"] == "HuggingFaceTB/finemath":
+            ds = ds.cast(math_features)
+        elif src["path"] == "openbmb/UltraInteract_sft":
+            ds = ds.cast(sft_features)
+        else:
+            ds = ds.cast(prose_features)
             
         hf_datasets.append(ds)
 
@@ -148,7 +147,6 @@ def build_and_upload_dataset(hf_export_repo: str):
     print("-" * 60)
 
     for row in interleaved:
-        # Fallback tracking resolution for wrapped streams
         resolved_key = row.get("__resolved_source__")
         src_config = source_map.get(resolved_key, sources[0])
         
@@ -182,11 +180,9 @@ def build_and_upload_dataset(hf_export_repo: str):
             if len(current_shard_tokens) * dcfg.seq_len >= SHARD_SIZE_TOKENS:
                 print(f"📦 Assembling Batch Shard {shard_counter} | Accumulated Target: {total_tokens_written:,} tokens")
                 
-                # Zero-copy reference construction into dynamic PyArrow arrays
                 arr = np.array(current_shard_tokens, dtype=np.int32)
                 ds_export = Dataset.from_dict({"input_ids": arr})
                 
-                # Pushes incrementally without localized storage overheads
                 ds_export.push_to_hub(
                     hf_export_repo, 
                     split=f"train_shard_{shard_counter}",
@@ -194,7 +190,6 @@ def build_and_upload_dataset(hf_export_repo: str):
                     token=hf_token
                 )
                 
-                # Reclaim memory space right away
                 del arr
                 del ds_export
                 current_shard_tokens = []
