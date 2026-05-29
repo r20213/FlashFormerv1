@@ -10,10 +10,8 @@ from pathlib import Path
 # Core imports
 from datasets import load_dataset, interleave_datasets, Dataset
 import sentencepiece as spm
-from detoxify import Detoxify
-import fasttext
 
-# Performance Tuning for 4 vCPU environments (Prevents PyTorch from oversaturating CPU threads)
+# Performance Tuning for 4 vCPU environments
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -37,7 +35,7 @@ SHARD_SIZE_TOKENS = 100_000_000   # 100M tokens per shard (~200 files total)
 DEDUP_WINDOW_SIZE = 100_000       # Tracks last 100k document hashes seamlessly
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="GPU-Optimized Dataset Tokenization and Pack Pipeline")
+    parser = argparse.ArgumentParser(description="High-Throughput Dataset Tokenization and Pack Pipeline")
     parser.add_argument(
         "--hf_export_repo", 
         type=str, 
@@ -73,18 +71,7 @@ def build_and_upload_dataset(hf_export_repo: str):
         if src.get("path") == "bigcode/starcoderdata" and src.get("name") == "c++":
             src["name"] = "cpp"
 
-    print("Loading Multi-GPU & CPU Filter Handlers...")
-    
-    # 2x T4 GPU Optimization: Dual-Model Pipeline Round-Robin Setup
-    # Instead of multi-processing (which copies the 27GB RAM space and crashes your system),
-    # we instantiate two model references targeted at different cuda devices on the main thread.
-    print(" -> Allocating Detoxify Models to cuda:0 and cuda:1...")
-    detox_gpu0 = Detoxify("original", device="cuda:0")
-    detox_gpu1 = Detoxify("original", device="cuda:1")
-    detox_models = [detox_gpu0, detox_gpu1]
-    gpu_selector = 0  # Round-robin toggle pointer
-
-    ft_model = fasttext.load_model("tokenizer/fasttext_model.bin")
+    print("Loading Tokenizer Processor...")
     sp = spm.SentencePieceProcessor(model_file=dcfg.tokenizer_path)
 
     sources = dcfg.sources
@@ -92,11 +79,10 @@ def build_and_upload_dataset(hf_export_repo: str):
     hf_datasets = []
     
     print("Binding streaming generators to HuggingFace Hub repositories...")
-    for src in sources:
+    for idx, src in enumerate(sources):
         kwargs = {
             "streaming": True,
             "split": src["split"],
-            "trust_remote_code": True,
             "token": hf_token,
         }
         if src["path"] == "bigcode/starcoderdata":
@@ -104,7 +90,11 @@ def build_and_upload_dataset(hf_export_repo: str):
         elif src.get("name") is not None:
             kwargs["name"] = src["name"]
             
-        hf_datasets.append(load_dataset(src["path"], **kwargs))
+        ds = load_dataset(src["path"], **kwargs)
+        # Inject explicit unique string source path keys into dataset lines
+        source_key = f"{src['path']}:{src.get('name', '')}"
+        ds = ds.map(lambda r, sk=source_key: {"__resolved_source__": sk})
+        hf_datasets.append(ds)
 
     # Calculate probability matrices
     weights = [src["weight"] for src in sources]
@@ -121,27 +111,26 @@ def build_and_upload_dataset(hf_export_repo: str):
 
     # State containers
     buffer = []
-    
-    # RAM Optimization: Pre-allocate standard internal list to avoid structural memory overhead.
-    # Appending massive sublists elements to python lists grows objects footprint dramatically.
     current_shard_tokens = []
     shard_counter = 0
     total_tokens_written = 0
     
     # Inline Dedup Lookback Cache
     seen_hashes = collections.deque(maxlen=DEDUP_WINDOW_SIZE)
-    source_map = {src["path"]: src for src in sources}
+    source_map = {f"{src['path']}:{src.get('name', '')}": src for src in sources}
 
     print("\n🚀 Pipeline fully operational. Streaming tokens...")
     print("-" * 60)
 
     for row in interleaved:
         # Fallback tracking resolution for wrapped streams
-        src_config = source_map.get(row.get("__source__"), sources[0])
+        resolved_key = row.get("__resolved_source__")
+        src_config = source_map.get(resolved_key, sources[0])
         
         text = _extract_text_by_config(row, src_config)
+        
+        # FIXED: Changed broken execution 'return' crash statement to standard loop validation pass
         if text is None or len(text) < 40:
-            return None if text is None else len(text)
             continue
             
         # 1. Inline Window Deduplication
@@ -150,30 +139,7 @@ def build_and_upload_dataset(hf_export_repo: str):
             continue
         seen_hashes.append(doc_hash)
 
-        # 2. FastText Language Uniformity Classifier (CPU Bound)
-        try:
-            labels, scores = ft_model.predict(text.replace("\n", " "), k=1)
-            label = labels[0].replace("__label__", "")
-            if label != "en" or scores[0] < dcfg.lang_threshold:
-                continue
-        except Exception:
-            continue
-
-        # 3. Detoxify Content Guard Rail Filter (Dual GPU Round Robin Execution)
-        try:
-            # Alternates evaluation queries across both T4 GPUs dynamically on the fly
-            active_detox_model = detox_models[gpu_selector]
-            res = active_detox_model.predict(text)
-            gpu_selector = (gpu_selector + 1) % 2 # Flip-flop index pointer between [0, 1]
-            
-            if res.get("toxicity", 0.0) >= dcfg.toxicity_threshold:
-                continue
-        except Exception:
-            # Safely continue loop execution if string serialization fails
-            gpu_selector = (gpu_selector + 1) % 2
-            continue
-
-        # 4. Tokenization and Document Bounds Constraints Verification
+        # 2. Tokenization and Document Bounds Constraints Verification
         tokens = sp.Encode(text)
         if not (dcfg.min_doc_tokens <= len(tokens) <= dcfg.max_doc_tokens):
             continue
@@ -181,14 +147,14 @@ def build_and_upload_dataset(hf_export_repo: str):
         tokens.append(dcfg.eos_token_id)
         buffer.extend(tokens)
 
-        # 5. Pack Streams Into Uniform Matrix Context Blocks
+        # 3. Pack Streams Into Uniform Matrix Context Blocks
         while len(buffer) >= dcfg.seq_len:
             chunk = buffer[:dcfg.seq_len]
             current_shard_tokens.append(chunk)
             buffer = buffer[dcfg.seq_len:]
             total_tokens_written += dcfg.seq_len
             
-            # 6. Periodic Batch Export to Gated Hub Destination Repo
+            # 4. Periodic Batch Export to Gated Hub Destination Repo
             if len(current_shard_tokens) * dcfg.seq_len >= SHARD_SIZE_TOKENS:
                 print(f"📦 Assembling Batch Shard {shard_counter} | Accumulated Target: {total_tokens_written:,} tokens")
                 
