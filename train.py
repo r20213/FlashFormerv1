@@ -324,7 +324,7 @@ def _sample_prompts(model, cfg, device):
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu=modal.gpu.H100(),
+    gpu="H100:1",
     timeout=4 * 3600,  # 4-hour wall clock limit
     volumes={VOLUME_MOUNT: volume},
     secrets=[modal.Secret.from_name("pretrain-secrets")],
