@@ -24,7 +24,7 @@ import math
 import time
 import shutil
 from pathlib import Path
-
+import torch
 import modal
 
 # ---------------------------------------------------------------------------
