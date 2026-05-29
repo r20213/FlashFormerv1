@@ -52,6 +52,11 @@ image = (
         "numpy",
         "tqdm",
     )
+    # Replaces the deprecated mounts configuration
+    .add_local_dir("model", remote_path="/root/model")
+    .add_local_dir("data", remote_path="/root/data")
+    .add_local_file("config.py", remote_path="/root/config.py")
+    .add_local_file("tokenizer/spm.model", remote_path="/root/tokenizer/spm.model")
 )
 
 app = modal.App("pretrain-235m", image=image)
@@ -328,14 +333,6 @@ def _sample_prompts(model, cfg, device):
     timeout=4 * 3600,  # 4-hour wall clock limit
     volumes={VOLUME_MOUNT: volume},
     secrets=[modal.Secret.from_name("pretrain-secrets")],
-    mounts=[
-        # Mount the local model/ and data/ packages so Modal can import them
-        Mount.from_local_dir("model",     remote_path="/root/model"),
-        Mount.from_local_dir("data",      remote_path="/root/data"),
-        Mount.from_local_file("config.py", remote_path="/root/config.py"),
-        Mount.from_local_file("tokenizer/spm.model",
-                                    remote_path="/root/tokenizer/spm.model"),
-    ],
 )
 def train():
     import torch
