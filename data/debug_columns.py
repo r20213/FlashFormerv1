@@ -4,7 +4,7 @@ from datasets import load_dataset
 from huggingface_hub import login
 from pathlib import Path
 
-# Adds /kaggle/working/FlashFormerv1 to your search path
+# Adds parent directory to your search path
 parent_dir = Path(__file__).resolve().parents[1]
 if str(parent_dir) not in sys.path:
     sys.path.append(str(parent_dir))

@@ -5,6 +5,7 @@ import numpy as np
 import collections
 import hashlib
 from typing import Optional
+from pathlib import Path
 
 # Core imports
 from datasets import load_dataset, interleave_datasets, Dataset
@@ -19,6 +20,10 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+# Adds parent directory to your search path
+parent_dir = Path(__file__).resolve().parents[1]
+if str(parent_dir) not in sys.path:
+    sys.path.append(str(parent_dir))
 # Force path resolution for local configurations
 sys.path.append(os.getcwd())
 try:
