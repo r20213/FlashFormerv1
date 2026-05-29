@@ -42,6 +42,12 @@ def parse_args():
         required=True, 
         help="Mandatory Hugging Face repository destination (e.g., 'username/prefiltered-packed-235m')"
     )
+    parser.add_argument(
+        "--tokenizer_path", 
+        type=str, 
+        required=True, 
+        help="Mandatory path to the SentencePiece tokenizer model file (e.g., 'spm.model')"
+    )
     return parser.parse_args()
 
 def _extract_text_by_config(row: dict, src_config: dict) -> Optional[str]:
@@ -72,7 +78,7 @@ def build_and_upload_dataset(hf_export_repo: str):
             src["name"] = "cpp"
 
     print("Loading Tokenizer Processor...")
-    sp = spm.SentencePieceProcessor(model_file=dcfg.tokenizer_path)
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
 
     sources = dcfg.sources
     hf_token = os.environ.get("HF_TOKEN", None)
