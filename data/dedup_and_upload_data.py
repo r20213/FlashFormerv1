@@ -46,14 +46,13 @@ def parse_args():
         "--tokenizer_path", 
         type=str, 
         required=True, 
-        help="Mandatory path to the SentencePiece tokenizer model file (e.g., 'spm.model')"
+        help="Mandatory path to the SentencePiece tokenizer model file (e.g., 'tokenizer.model')"
     )
     return parser.parse_args()
 
 def _extract_text_by_config(row: dict, src_config: dict) -> Optional[str]:
     """Extracts text strings adhering exactly to DataConfig structural keys."""
     path = src_config["path"]
-    col = src_config.get("text_column")
 
     if path == "openbmb/UltraInteract_sft":
         instruction = (row.get("instruction") or "").strip()
@@ -62,6 +61,7 @@ def _extract_text_by_config(row: dict, src_config: dict) -> Optional[str]:
             return None
         return f"{instruction}\n\n{response}"
 
+    col = "content" if path == "bigcode/starcoderdata" else src_config.get("text_column")
     if col and col in row:
         val = row[col]
         if val and isinstance(val, str):
@@ -89,6 +89,7 @@ def build_and_upload_dataset(hf_export_repo: str):
         kwargs = {
             "streaming": True,
             "split": src["split"],
+            "trust_remote_code": True,
             "token": hf_token,
         }
         if src["path"] == "bigcode/starcoderdata":
@@ -97,9 +98,27 @@ def build_and_upload_dataset(hf_export_repo: str):
             kwargs["name"] = src["name"]
             
         ds = load_dataset(src["path"], **kwargs)
-        # Inject explicit unique string source path keys into dataset lines
+        
+        # Resolve target parsing columns for this stream
+        text_col = "content" if src["path"] == "bigcode/starcoderdata" else src.get("text_column")
         source_key = f"{src['path']}:{src.get('name', '')}"
+        
+        # 1. Map to resolve the source key tracker
         ds = ds.map(lambda r, sk=source_key: {"__resolved_source__": sk})
+        
+        # 2. Strict Column Selection: Isolates structural keys and drops dirty meta configurations
+        columns_to_keep = ["__resolved_source__"]
+        if text_col:
+            columns_to_keep.append(text_col)
+        if src["path"] == "openbmb/UltraInteract_sft":
+            columns_to_keep.extend(["instruction", "response"])
+            
+        # Extract features safely to prune conflicting float/int types
+        all_cols = list(ds.features.keys()) if hasattr(ds, "features") and ds.features else []
+        if all_cols:
+            cols_to_remove = [c for c in all_cols if c not in columns_to_keep]
+            ds = ds.remove_columns(cols_to_remove)
+            
         hf_datasets.append(ds)
 
     # Calculate probability matrices
@@ -135,7 +154,6 @@ def build_and_upload_dataset(hf_export_repo: str):
         
         text = _extract_text_by_config(row, src_config)
         
-        # FIXED: Changed broken execution 'return' crash statement to standard loop validation pass
         if text is None or len(text) < 40:
             continue
             
@@ -166,10 +184,10 @@ def build_and_upload_dataset(hf_export_repo: str):
                 
                 # Zero-copy reference construction into dynamic PyArrow arrays
                 arr = np.array(current_shard_tokens, dtype=np.int32)
-                ds = Dataset.from_dict({"input_ids": arr})
+                ds_export = Dataset.from_dict({"input_ids": arr})
                 
                 # Pushes incrementally without localized storage overheads
-                ds.push_to_hub(
+                ds_export.push_to_hub(
                     hf_export_repo, 
                     split=f"train_shard_{shard_counter}",
                     private=True,
@@ -178,7 +196,7 @@ def build_and_upload_dataset(hf_export_repo: str):
                 
                 # Reclaim memory space right away
                 del arr
-                del ds
+                del ds_export
                 current_shard_tokens = []
                 shard_counter += 1
                 
