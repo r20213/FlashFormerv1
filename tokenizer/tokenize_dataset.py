@@ -24,6 +24,7 @@ image = (
     modal.Image.debian_slim()
     .pip_install("transformers", "tokenizers", "numpy", "datasets", "fsspec")
     .env({"TOKENIZERS_PARALLELISM": "false"})
+    .add_local_file("config.py", remote_path="/root/config.py")
 )
 
 app = modal.App("mathformer-distributed-pretrain-pack", image=image)
