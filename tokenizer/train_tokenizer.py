@@ -116,16 +116,18 @@ def build_deepmath_text(row: dict) -> str:
 # ─────────────────────────────────────────────────────────────
 
 class TrainingCorpusIterator:
-    """Streamed generator matching the Tokenizer API specs to prevent memory accumulation."""
-    def __init__(self, token: str, word_cap: int):
+    """Streamed generator that groups strings into small batches to prevent Rust thread queue inflation."""
+    def __init__(self, token: str, word_cap: int, batch_size: int = 1_000):
         self.token = token
         self.word_cap = word_cap
+        self.batch_size = batch_size
         self.word_count = 0
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self) -> Iterator[List[str]]:
         self.word_count = 0
         eval_nemotron_offset = C.NEMOTRON_EVAL_ROWS
         eval_deepmath_offset = C.DEEPMATH_EVAL_ROWS
+        current_batch = []
 
         # 1. Stream Nemotron
         nemotron_ds = load_dataset(
@@ -135,25 +137,38 @@ class TrainingCorpusIterator:
 
         for row in nemotron_ds:
             if self.word_count >= self.word_cap:
+                if current_batch: yield current_batch
                 return
             text = normalize_text(row.get(C.NEMOTRON_TEXT_COL, "") or "")
             if len(text) > 50:
                 self.word_count += len(text.split())
-                yield text
+                current_batch.append(text)
+                
+                if len(current_batch) >= self.batch_size:
+                    yield current_batch
+                    current_batch = []
 
-        # 2. Stream DeepMath
+        # 2. Stream DeepMath (Lowered buffer size to 2,000 for tight RAM stability)
         deepmath_ds = load_dataset(
             C.DEEPMATH_DATASET, split=C.DEEPMATH_SPLIT,
             streaming=True, token=self.token
-        ).skip(eval_deepmath_offset).shuffle(seed=C.RANDOM_SEED, buffer_size=5_000)
+        ).skip(eval_deepmath_offset).shuffle(seed=C.RANDOM_SEED, buffer_size=2_000)
 
         for row in deepmath_ds:
             if self.word_count >= self.word_cap:
+                if current_batch: yield current_batch
                 return
             text = normalize_text(build_deepmath_text(row))
             if len(text) > 50:
                 self.word_count += len(text.split())
-                yield text
+                current_batch.append(text)
+                
+                if len(current_batch) >= self.batch_size:
+                    yield current_batch
+                    current_batch = []
+
+        if current_batch:
+            yield current_batch
 
 
 def get_eval_set(token: str) -> List[str]:
@@ -197,7 +212,10 @@ def build_tokenizer() -> Tokenizer:
     return tokenizer
 
 def train_tokenizer(tokenizer: Tokenizer, iterator: TrainingCorpusIterator) -> Tokenizer:
-    os.environ.setdefault("RAYON_NUM_THREADS", str(os.cpu_count() or 4))
+    # Hard cap worker threads slightly below max vCPUs to give the process breathing room
+    os.environ["RAYON_NUM_THREADS"] = "2"
+    log.info(f"Enforcing safe fallback threading limits: RAYON_NUM_THREADS = {os.environ['RAYON_NUM_THREADS']}")
+
     trainer = BpeTrainer(
         vocab_size=C.VOCAB_SIZE,
         min_frequency=C.MIN_FREQUENCY,
@@ -207,7 +225,7 @@ def train_tokenizer(tokenizer: Tokenizer, iterator: TrainingCorpusIterator) -> T
         continuing_subword_prefix="##",
         end_of_word_suffix="",
     )
-    log.info("Executing inline Rust BPE engine...")
+    log.info("Executing inline Rust BPE engine via bounded batch queues...")
     tokenizer.train_from_iterator(iterator, trainer=trainer)
     return tokenizer
 
