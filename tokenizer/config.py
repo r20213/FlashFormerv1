@@ -13,7 +13,7 @@ UNICODE_NORM_FORM = "NFC"
 # Resource & Target Capacities
 VOCAB_SIZE = 16_000
 MIN_FREQUENCY = 20
-TRAIN_WORD_CAP = 15_000_000  # ~15M tokens allocation overhead
+TRAIN_WORD_CAP = 5_000_000  # ~5M tokens allocation overhead
 
 # Dataset Stream Targets
 NEMOTRON_DATASET = "nvidia/Nemotron-CC-Math-v1"
