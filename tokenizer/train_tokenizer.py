@@ -167,8 +167,6 @@ def main():
         max_sentence_length=100000,
         hard_vocab_limit=False,
         byte_fallback=False,
-        
-        # ─── YOUR WORKING WHITESPACE PRESERVATION ARGS ───
         split_by_whitespace=False,
         remove_extra_whitespaces=False
     )
@@ -195,7 +193,7 @@ def main():
     )
     
     # Re-apply all additional structural tokens into the Fast model layer configuration
-    fast_tok.add_special_tokens({"additional_special_tokens": user_symbols})
+    # fast_tok.add_special_tokens({"additional_special_tokens": user_symbols})
 
     # Save target JSON and configuration metadata assets
     fast_tok.save_pretrained(str(OUTPUT_DIR))
