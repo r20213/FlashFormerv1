@@ -49,7 +49,7 @@ PRETRAIN_TARGET_TOKENS = 10_000
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
     Independent parallel worker block. Updates the central modal.Dict tracking
-    registers live to feed the local coordinator's sequential loop interface.
+    registers live and safely self-terminates when the target token count is reached.
     """
     import numpy as np
     from datasets import load_dataset
@@ -81,7 +81,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     lvl5_processed = 0
     buffer_ids = []
     
-    # Keeping threshold at 500k to simulate true production memory conditions
+    # Flush threshold configuration
     FLUSH_THRESHOLD = 1_000 
     
     progress_bar = tqdm(
@@ -132,6 +132,16 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
                 print(f"⭐ [Progress Report] Worker {worker_id} pushed {tokens_saved_count:,} total tokens to disk storage layer.", flush=True)
                 progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
                 
+                # 🛑 CLUSTER BRAKE: Check total progress inside the worker container
+                try:
+                    current_map = global_state.to_dict()
+                    total_cluster_tokens = sum(v for k, v in current_map.items() if k.startswith("tokens_"))
+                    if total_cluster_tokens >= PRETRAIN_TARGET_TOKENS:
+                        print(f"🛑 [Worker {worker_id}] Global target limit of {PRETRAIN_TARGET_TOKENS:,} tokens detected. Breaking stream.")
+                        break
+                except Exception:
+                    pass
+                
         # Final residual cache sweep
         if buffer_ids:
             np_array = np.array(buffer_ids, dtype=np.uint16)
@@ -170,8 +180,6 @@ def main():
     
     print("✨ Launching 100 parallel workers across cluster matrix...\n")
     
-    # We loop over starmap natively. By intercepting outputs on the fly, 
-    # we can sequentially calculate total data metrics accurately.
     total_tokens_accumulated = 0
     aggregate_lvl4 = 0
     aggregate_lvl5 = 0
@@ -193,17 +201,18 @@ def main():
         elapsed_mins = (time.time() - t0) / 60
         estimated_cost = elapsed_mins * 0.21
         
-        # Clean ticking log update frame
+        # Ticking terminal log update
+        current_max_tokens = max(live_tokens, total_tokens_accumulated)
         sys.stdout.write(
-            f"\r📈 Global Live Matrix: {max(live_tokens, total_tokens_accumulated):,} / {PRETRAIN_TARGET_TOKENS:,} tokens | "
-            f"L4: {max(live_l4, aggregate_lvl4):,} | L5: {max(live_l5, aggregate_lvl5):,} | "
+            f"\r📈 Global Live Matrix: {current_max_tokens:,} / {PRETRAIN_TARGET_TOKENS:,} tokens | "
+            f"L4 Docs: {max(live_l4, aggregate_lvl4):,} | L5 Docs: {max(live_l5, aggregate_lvl5):,} | "
             f"⏱️ Runtime: {timedelta(seconds=int(time.time() - t0))} | "
             f"💸 Est. Cost: ${estimated_cost:.2f}"
         )
         sys.stdout.flush()
         
-        # Safe termination condition: exits cleanly, committing volume metadata snapshots!
-        if max(live_tokens, total_tokens_accumulated) >= PRETRAIN_TARGET_TOKENS:
+        # Main thread catch-all limit breaker
+        if current_max_tokens >= PRETRAIN_TARGET_TOKENS:
             print(f"\n\n🎯 Target Matrix Limit of {PRETRAIN_TARGET_TOKENS:,} tokens reached successfully!")
             break
             
