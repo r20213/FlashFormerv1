@@ -30,8 +30,8 @@ image = (
 app = modal.App("mathformer-distributed-pretrain-pack", image=image)
 data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=True)
 
-# FIX: Explicitly bind an ephemeral Queue directly to the app layout
-app.global_metrics_queue = modal.Queue.new()
+# FIX: Bind a lifecycle-managed cloud Queue directly to the app instance layout
+app.global_metrics_queue = modal.Queue.ephemeral()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker Function
