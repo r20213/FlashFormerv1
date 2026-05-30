@@ -40,7 +40,8 @@ if not HF_TOKEN:
 OUTPUT_DIR = Path("./mathformer_16k_final")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TMP_CORPUS_FILE = OUTPUT_DIR / "normalized_nemotron_corpus.txt"
-
+os.environ["RAYON_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ─────────────────────────────────────────────────────────────
 # 1. Normalization Flow
 # ─────────────────────────────────────────────────────────────
