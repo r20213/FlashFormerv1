@@ -1,8 +1,8 @@
 """
-train_unigram_tokenizer.py
-──────────────────────────
-Trains a 16K SentencePiece-equivalent (Unigram) tokenizer natively in Python/Rust.
-Preserves exact normalization rules and regex pre-tokenization boundaries without high RAM overhead.
+train_unigram_file_based.py
+───────────────────────────
+Streams, normalizes, and writes Nemotron to a local flat file,
+then triggers the file-backed Rust Unigram trainer to guarantee low RAM.
 """
 
 import os
@@ -13,7 +13,7 @@ import unicodedata
 import logging
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterator, List
+from tqdm import tqdm
 
 from datasets import load_dataset
 from tokenizers import Tokenizer
@@ -25,11 +25,8 @@ from transformers import PreTrainedTokenizerFast
 
 import config as C
 
-# ─────────────────────────────────────────────────────────────
-# 0. Setup & Silence Logging
-# ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("mathformer_unigram")
+log = logging.getLogger("mathformer_flat")
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -37,11 +34,12 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 if not HF_TOKEN:
-    log.error("Missing HF_TOKEN environment variable.")
+    log.error("Missing HF_TOKEN env variable.")
     sys.exit(1)
 
-OUTPUT_DIR = Path("./mathformer_16k_unigram")
+OUTPUT_DIR = Path("./mathformer_16k_final")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TMP_CORPUS_FILE = OUTPUT_DIR / "normalized_nemotron_corpus.txt"
 
 # ─────────────────────────────────────────────────────────────
 # 1. Normalization Flow
@@ -58,75 +56,57 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 # ─────────────────────────────────────────────────────────────
-# 2. Batch Streaming Iterator
+# 2. Stage 1: Write Normalized Raw Text to Disk
 # ─────────────────────────────────────────────────────────────
-from tqdm import tqdm
+def build_local_corpus():
+    if TMP_CORPUS_FILE.exists():
+        log.info(f"💾 Found existing normalized corpus file at {TMP_CORPUS_FILE}. Skipping extraction.")
+        return
 
-class BatchIterator:
-    def __init__(self, token: str, word_cap: int, batch_size: int = 1_000):
-        self.token = token
-        self.word_cap = word_cap
-        self.batch_size = batch_size
+    log.info(f"📝 Creating flat normalized corpus file: {TMP_CORPUS_FILE}")
+    word_count = 0
+    estimated_total_lines = C.TRAIN_WORD_CAP // 150  # rough proxy for pbar
+    
+    ds = load_dataset(
+        C.NEMOTRON_DATASET, C.NEMOTRON_SUBSET,
+        split=C.NEMOTRON_SPLIT, streaming=True, token=HF_TOKEN
+    ).skip(C.NEMOTRON_EVAL_ROWS)
 
-    def __iter__(self) -> Iterator[List[str]]:
-        word_count = 0
-        current_batch = []
-        
-        # Approximate how many batches total we will stream for the progress bar
-        estimated_total_batches = self.word_cap // self.batch_size
-        
-        ds = load_dataset(
-            C.NEMOTRON_DATASET, C.NEMOTRON_SUBSET,
-            split=C.NEMOTRON_SPLIT, streaming=True, token=self.token
-        ).skip(C.NEMOTRON_EVAL_ROWS)
+    pbar = tqdm(total=C.TRAIN_WORD_CAP, desc="✍️ Writing normalized lines to disk", unit="word")
 
-        # Instantiate a clean, customizable progress bar layout
-        pbar = tqdm(
-            total=estimated_total_batches, 
-            desc="📥 Streaming & Processing Batches", 
-            unit="batch",
-            dynamic_ncols=True
-        )
-
+    with open(TMP_CORPUS_FILE, "w", encoding="utf-8") as f:
         for row in ds:
-            if word_count >= self.word_cap:
-                if current_batch: 
-                    yield current_batch
-                    pbar.update(1)
-                pbar.close()
-                return
+            if word_count >= C.TRAIN_WORD_CAP:
+                break
             
             text = normalize_text(row.get(C.NEMOTRON_TEXT_COL, "") or "")
             if len(text) > 50:
                 words_in_row = len(text.split())
                 word_count += words_in_row
-                current_batch.append(text)
                 
-                if len(current_batch) >= self.batch_size:
-                    yield current_batch
-                    current_batch = []
-                    
-                    # Update progress bar and show absolute running word count
-                    pbar.update(1)
-                    pbar.set_postfix({"processed_words": f"{word_count:,}"})
-                    
-        if current_batch:
-            yield current_batch
-            pbar.update(1)
-            
-        pbar.close()
+                # Write each text block separated by a newline
+                # Replace internal single newlines with spaces if you want line-by-line training
+                cleaned_line = text.replace("\n", " ")
+                f.write(cleaned_line + "\n")
+                
+                pbar.update(words_in_row)
+                
+    pbar.close()
+    log.info(f"✓ Local cache successfully prepared. Total words: {word_count:,}")
 
 # ─────────────────────────────────────────────────────────────
-# 3. Core Engine Build
+# 3. Stage 2: Train via File References
 # ─────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
-    log.info("🚀 Instantiating Unigram Tokenizer structural framework...")
+    
+    # Run data extraction step
+    build_local_corpus()
 
-    # Initialize empty Unigram model instead of BPE
+    log.info("⚙️ Configuring Tokenizer structural rules...")
     tokenizer = Tokenizer(Unigram())
 
-    # 1. YOUR EXACT NORMALIZATION SET
+    # YOUR EXACT NORMALIZATION SET
     tokenizer.normalizer = NormSequence([
         NFC(), Strip(),
         Replace("\u00a0", " "), Replace("\u2009", " "),
@@ -134,14 +114,12 @@ def main():
         Replace("\u2002", " "), Replace("\u200b", ""), Replace("\ufeff", ""),
     ])
 
-    # 2. YOUR EXACT REGEX PRE-TOKENIZATION RULES
+    # YOUR EXACT REGEX PRE-TOKENIZATION RULES
     tokenizer.pre_tokenizer = Split(
         pattern=C.PRETOKENIZER_REGEX,
         behavior="isolated"
     )
 
-    # 3. Configure the Unigram Trainer
-    # Unigram automatically uses SentencePiece's optimization logic under the hood
     trainer = UnigramTrainer(
         vocab_size=C.VOCAB_SIZE,
         special_tokens=C.SPECIAL_TOKENS,
@@ -149,14 +127,13 @@ def main():
         unk_token=C.UNK_TOKEN,
     )
 
-    # Stream text through your exact normalization/regex parameters
-    log.info(f"📥 Streaming data from {C.NEMOTRON_DATASET} directly through Rust pipes...")
-    iterator = BatchIterator(token=HF_TOKEN, word_cap=C.TRAIN_WORD_CAP)
-    
-    tokenizer.train_from_iterator(iterator, trainer=trainer)
-    log.info("✓ Core model training complete.")
+    # HERE IS THE RAM PROTECTION SAVIOR:
+    # Instead of an iterator, pass the file path as a string list.
+    log.info("🔨 Launching file-streamed Rust Unigram Trainer...")
+    tokenizer.train([str(TMP_CORPUS_FILE)], trainer=trainer)
+    log.info("✓ Tokenizer training complete.")
 
-    # 4. Wrap into Fast Tokenizer Class
+    # Wrap to Fast Tokenizer
     fast_tok = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         unk_token=C.UNK_TOKEN, bos_token=C.BOS_TOKEN,
@@ -170,19 +147,24 @@ def main():
         ]
     })
 
-    # Save outputs locally
     fast_tok.save_pretrained(str(OUTPUT_DIR))
-    log.info(f"💾 Fast tokenizer config saved to: {OUTPUT_DIR}")
+    log.info(f"💾 Converted fast configuration assets saved to: {OUTPUT_DIR}")
 
     # Push to Hub
-    log.info(f"📦 Synchronizing assets with Hugging Face Hub: {C.HUB_REPO_ID}")
+    log.info(f"🚀 Pushing final assets to Hub: {C.HUB_REPO_ID}")
     fast_tok.push_to_hub(
         C.HUB_REPO_ID,
-        commit_message="Deploy safe 16K native Unigram tokenizer directly from stream.",
+        commit_message="Deploy file-backed 16K Unigram tokenizer safely.",
         token=HF_TOKEN,
         private=False
     )
-    log.info(f"🏁 Process complete in {timedelta(seconds=int(time.time() - t0))}")
+    
+    # Optional cleanup of the big text file
+    if TMP_CORPUS_FILE.exists():
+        os.remove(TMP_CORPUS_FILE)
+        log.info("🧹 Cleaned up temporary local corpus file.")
+        
+    log.info(f"🏁 Complete execution pipeline wrapped in {timedelta(seconds=int(time.time() - t0))}")
 
 if __name__ == "__main__":
     main()
