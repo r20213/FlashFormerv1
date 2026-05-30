@@ -145,7 +145,7 @@ def main():
     aggregate_lvl5 = 0
     
     # Gather execution tracking from all workers asynchronously
-    for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_preserved=False):
+    for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False):
         total_tokens_accumulated += partial_count
         aggregate_lvl4 += l4
         aggregate_lvl5 += l5
