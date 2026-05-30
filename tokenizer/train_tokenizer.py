@@ -23,7 +23,7 @@ from transformers.convert_slow_tokenizer import SpmConverter
 
 import config as C
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] % %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mathformer_spm")
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -153,7 +153,7 @@ def main():
         model_prefix=SPM_MODEL_PREFIX,
         vocab_size=C.VOCAB_SIZE,
         model_type="unigram",
-        normalization_rule_name="nfc",          # Handles standard NFC constraints
+        normalization_rule_name="nfkc",         # Fixed mapping parameter
         max_sentencepiece_length=16,            # Limits maximum length of structural tokens
         split_digits=True,                      # Forces number fracturing ('4', '2' instead of '42')
         user_defined_symbols=",".join(user_symbols), # Forces structural tokens to remain unbroken
