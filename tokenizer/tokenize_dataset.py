@@ -33,9 +33,6 @@ data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=
 # Shared cloud dictionary layer to sync counters seamlessly across nodes
 global_state = modal.Dict.from_name("pretrain-global-state", create_if_missing=True)
 
-# Override configuration target live for micro-testing matrix limits
-PRETRAIN_TARGET_TOKENS = 10_000
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker Function (Standard Return Layout)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,7 +79,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     buffer_ids = []
     
     # Flush threshold configuration
-    FLUSH_THRESHOLD = 1_000 
+    FLUSH_THRESHOLD = 500_000 
     
     progress_bar = tqdm(
         dataset,
