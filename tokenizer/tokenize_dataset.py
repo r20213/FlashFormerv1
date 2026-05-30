@@ -22,7 +22,8 @@ except Exception as e:
 # Define hardware cluster parameters matching your exact operational spec
 image = (
     modal.Image.debian_slim()
-    .pip_install("transformers", "tokenizers", "numpy", "datasets", "fsspec")
+    # Added tqdm explicitly to the cloud environment mapping
+    .pip_install("transformers", "tokenizers", "numpy", "datasets", "fsspec", "tqdm")
     .env({"TOKENIZERS_PARALLELISM": "false"})
     .add_local_python_source("config")
 )
@@ -42,36 +43,31 @@ data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=
 )
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
-    Independent parallel worker block. Streams data deterministically using a
-    modulo identity matrix to completely eliminate cross-worker row collisions.
-    Balances lvl 4 and lvl 5 data dynamically on the fly to a 50/50 split.
+    Independent parallel worker block. Uses native HF dataset sharding to achieve 
+    guaranteed mathematically isolated row spaces (no double processing).
+    Tracks real-time progress using cloud-optimized tqdm parameters.
     """
     import numpy as np
     from datasets import load_dataset
     from transformers import AutoTokenizer
+    from tqdm import tqdm
     import random
     
     print(f"👷 [Worker {worker_id}/{num_workers}] Initializing tokenizer layer...")
-    # Pulling directly from your verified repository deployment asset
     tokenizer = AutoTokenizer.from_pretrained(C.HUB_REPO_ID, token=os.environ["HF_TOKEN"])
     
-    print(f"🎯 [Worker {worker_id}/{num_workers}] Connecting to streaming dataset slice...")
+    print(f"🎯 [Worker {worker_id}/{num_workers}] Binding to unique server-side stream split...")
+    # .shard() ensures worker strictly downloads its 1/N partition over the network
     dataset = load_dataset(
         C.NEMOTRON_DATASET,
         name=C.NEMOTRON_SUBSET,
         split=C.NEMOTRON_SPLIT,
         streaming=True,
         token=os.environ["HF_TOKEN"]
-    )
+    ).shard(num_shards=num_workers, index=worker_id)
     
-    # Isolate individual worker sequence spaces to ensure uniform, deterministic skipping
     random.seed(42 + worker_id)
-    
-    # Keeping ~14% of Level 4 items downsamples their heavy presence inside the 
-    # 4plus subset to match the scarcer Level 5 count perfectly.
     LVL4_KEEP_PROB = 0.14
-    
-    # Direct binary append stream - optimal memory throughput layout
     shard_file_path = f"/data/tokens_shard_{worker_id}.bin"
     
     tokens_saved_count = 0
@@ -80,14 +76,16 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     buffer_ids = []
     FLUSH_THRESHOLD = 500_000 # Memory-flush gate to balance disk I/O
     
+    # Wrap stream with a cloud-safe tqdm configuration to prevent log-flooding
+    progress_bar = tqdm(
+        dataset,
+        desc=f"👷 Shard {worker_id}",
+        mininterval=15.0,  # Limits log updates to once every 15 seconds
+        unit=" rows"
+    )
+    
     with open(shard_file_path, "wb") as f_out:
-        # Enumerate stream to isolate deterministic unique row indices
-        for idx, row in enumerate(dataset):
-            # 6. Strict Worker Isolation Rule (No double processing)
-            if idx % num_workers != worker_id:
-                continue
-                
-            # Filter rows based on metadata schema criteria
+        for row in progress_bar:
             metadata = row.get("metadata", {})
             score = metadata.get("finemath_int_scores", 0)
             
@@ -99,14 +97,12 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             elif score == 5:
                 lvl5_processed += 1
             else:
-                # Fallback guard against unexpected metadata entries
                 continue
                 
             raw_text = row.get(C.NEMOTRON_TEXT_COL, "")
             if not raw_text:
                 continue
                 
-            # Run lightning-fast C-level layout execution pass
             enc = tokenizer(raw_text, add_special_tokens=False)
             buffer_ids.extend(enc["input_ids"])
             
@@ -116,6 +112,10 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
                 f_out.write(np_array.tobytes())
                 tokens_saved_count += len(np_array)
                 buffer_ids.clear()
+                f_out.flush()
+                
+                # Update progress bar metrics on every disk-flush sequence
+                progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
                 
         # Final residual cache sweep
         if buffer_ids:
@@ -124,7 +124,11 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             tokens_saved_count += len(np_array)
             buffer_ids.clear()
             
-    print(f"💾 [Worker {worker_id}] Tokenization phase terminated. Saved: {tokens_saved_count:,} tokens (Lvl4 rows: {lvl4_processed:,}, Lvl5 rows: {lvl5_processed:,}).")
+    print(f"💾 [Worker {worker_id}] Tokenization completed. Saved: {tokens_saved_count:,} tokens.")
+    
+    # Explicitly commit files to the Modal Network Volume
+    data_volume.commit()
+    
     return tokens_saved_count, lvl4_processed, lvl5_processed
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,13 +149,15 @@ def main():
     aggregate_lvl4 = 0
     aggregate_lvl5 = 0
     
-    # Gather execution tracking from all workers asynchronously
+    # Gather tracking metrics from workers dynamically as they complete
     for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False):
         total_tokens_accumulated += partial_count
         aggregate_lvl4 += l4
         aggregate_lvl5 += l5
         
-        # Immediate tracking check against configuration parameters
+        # Incremental terminal output tracking whenever a shard drops its data payload
+        print(f"📈 Global Accumulation Matrix: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens.")
+        
         if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
             print(f"\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} reached.")
             break
