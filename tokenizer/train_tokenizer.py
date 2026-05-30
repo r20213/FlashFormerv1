@@ -60,6 +60,8 @@ def normalize_text(text: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # 2. Batch Streaming Iterator
 # ─────────────────────────────────────────────────────────────
+from tqdm import tqdm
+
 class BatchIterator:
     def __init__(self, token: str, word_cap: int, batch_size: int = 1_000):
         self.token = token
@@ -70,26 +72,49 @@ class BatchIterator:
         word_count = 0
         current_batch = []
         
+        # Approximate how many batches total we will stream for the progress bar
+        estimated_total_batches = self.word_cap // self.batch_size
+        
         ds = load_dataset(
             C.NEMOTRON_DATASET, C.NEMOTRON_SUBSET,
             split=C.NEMOTRON_SPLIT, streaming=True, token=self.token
         ).skip(C.NEMOTRON_EVAL_ROWS)
 
+        # Instantiate a clean, customizable progress bar layout
+        pbar = tqdm(
+            total=estimated_total_batches, 
+            desc="📥 Streaming & Processing Batches", 
+            unit="batch",
+            dynamic_ncols=True
+        )
+
         for row in ds:
             if word_count >= self.word_cap:
-                if current_batch: yield current_batch
+                if current_batch: 
+                    yield current_batch
+                    pbar.update(1)
+                pbar.close()
                 return
             
             text = normalize_text(row.get(C.NEMOTRON_TEXT_COL, "") or "")
             if len(text) > 50:
-                word_count += len(text.split())
+                words_in_row = len(text.split())
+                word_count += words_in_row
                 current_batch.append(text)
                 
                 if len(current_batch) >= self.batch_size:
                     yield current_batch
                     current_batch = []
+                    
+                    # Update progress bar and show absolute running word count
+                    pbar.update(1)
+                    pbar.set_postfix({"processed_words": f"{word_count:,}"})
+                    
         if current_batch:
             yield current_batch
+            pbar.update(1)
+            
+        pbar.close()
 
 # ─────────────────────────────────────────────────────────────
 # 3. Core Engine Build
