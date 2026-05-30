@@ -162,6 +162,7 @@ def main():
         special_tokens=C.SPECIAL_TOKENS,
         show_progress=True,
         unk_token=C.UNK_TOKEN,
+        max_piece_length=16,
     )
 
     # HERE IS THE RAM PROTECTION SAVIOR:
