@@ -169,7 +169,8 @@ def main():
         max_sentence_length=100000,             # 👈 Stops skipping long math blocks
         hard_vocab_limit=False,                 # 👈 Prevents crash if pool under-runs
         byte_fallback=False,
-        treat_whitespace_as_parts_of_pieces=True
+        split_by_whitespace=False,              # Stops pre-chopping strings at spaces
+        remove_extra_whitespaces=False,
     )
     log.info("✓ Native SentencePiece training cycle complete.")
 
