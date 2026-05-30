@@ -82,4 +82,5 @@ PROBE_EXPRESSIONS = [
 HUB_REPO_ID = "LastTransformer/MathFormer-16K-BPE"
 HUB_COMMIT_MESSAGE = "Optimize memory-efficient training workflow layout."
 TOKENIZED_DATA_VOLUME= "Pretraining-Tokenized-Data-5B"
-PRETRAIN_TARGET_TOKENS = 10_000_000_000
+# PRETRAIN_TARGET_TOKENS = 10_000_000_000
+PRETRAIN_TARGET_TOKENS = 10_000

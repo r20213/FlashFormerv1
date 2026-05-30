@@ -42,8 +42,8 @@ data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=
 )
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
-    Independent parallel worker block. Uses a lightweight stream generator filter 
-    to guarantee zero row collisions based purely on explicit worker_id index mapping.
+    Independent parallel worker block. Generates and yields real-time granular 
+    token data chunks back to the coordinator matrix loop.
     """
     import numpy as np
     from datasets import load_dataset
@@ -79,19 +79,25 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     progress_bar = tqdm(
         dataset,
         desc=f"👷 Shard {worker_id}",
-        mininterval=15.0, # Keeps output scannable without flooding terminal frames
+        mininterval=30.0, # Kept higher to optimize network processing speeds
         unit=" rows"
     )
     
     with open(shard_file_path, "wb") as f_out:
+        # Window tracking metrics buffers
+        l4_delta_buffer = 0
+        l5_delta_buffer = 0
+        
         for row in progress_bar:
             metadata = row.get("metadata", {})
             score = metadata.get("finemath_int_scores", 0)
             
             if score == 4:
                 lvl4_processed += 1
+                l4_delta_buffer += 1  
             elif score == 5:
                 lvl5_processed += 1
+                l5_delta_buffer += 1  
             else:
                 continue
                 
@@ -102,31 +108,45 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             enc = tokenizer(raw_text, add_special_tokens=False)
             buffer_ids.extend(enc["input_ids"])
             
-            # Flush tokens to disk at regular thresholds to preserve memory overhead
+            # Flush tokens to disk at regular thresholds
             if len(buffer_ids) >= FLUSH_THRESHOLD:
                 np_array = np.array(buffer_ids, dtype=np.uint16)
                 f_out.write(np_array.tobytes())
-                tokens_saved_count += len(np_array)
+                
+                delta_tokens = len(np_array)
+                tokens_saved_count += delta_tokens
                 buffer_ids.clear()
                 f_out.flush()
                 
-                # Streaming Output tracking: Prints directly through Modal's async engine logs
+                # Push file snapshots live to the dashboard view
+                data_volume.commit()
+                
                 print(f"⭐ [Progress Report] Worker {worker_id} pushed {tokens_saved_count:,} total tokens to disk storage layer.", flush=True)
                 progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
+                
+                # 1. YIELD ALL 3 THINGS LIVE
+                yield (delta_tokens, l4_delta_buffer, l5_delta_buffer)
+                
+                # FIX: Safely clear window buffers immediately after yielding 
+                l4_delta_buffer = 0
+                l5_delta_buffer = 0
                 
         # Final residual cache sweep
         if buffer_ids:
             np_array = np.array(buffer_ids, dtype=np.uint16)
             f_out.write(np_array.tobytes())
-            tokens_saved_count += len(np_array)
+            
+            delta_tokens = len(np_array)
+            tokens_saved_count += delta_tokens
             buffer_ids.clear()
+            f_out.flush()
+            
+            data_volume.commit()
+            
+            # 2. YIELD FINAL RESIDUAL VALUES
+            yield (delta_tokens, l4_delta_buffer, l5_delta_buffer)
             
     print(f"💾 [Worker {worker_id}] Processing finalized cleanly. Saved: {tokens_saved_count:,} tokens.")
-    
-    # Force instant flush from container memory straight to central volume
-    data_volume.commit()
-    
-    return tokens_saved_count, lvl4_processed, lvl5_processed
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local Orchestration Coordinator
@@ -148,16 +168,28 @@ def main():
     
     print("✨ Launching 100 parallel workers across cluster matrix...\n")
     
-    # starmap returns a generator that consumes worker stdout logs on the fly
+    # Consumes granular generator updates out-of-order live from the cluster
     for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False):
         total_tokens_accumulated += partial_count
         aggregate_lvl4 += l4
         aggregate_lvl5 += l5
         
-        print(f"📈 Shard Closed. Global Counter Matrix: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens.")
+        # Calculate exactly how much money you have spent up to this second
+        elapsed_mins = (time.time() - t0) / 60
+        estimated_cost = elapsed_mins * 0.21
+        
+        # Unified tracking output frame
+        sys.stdout.write(
+            f"\r📈 Global Counter Matrix: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens "
+            f"({(total_tokens_accumulated / C.PRETRAIN_TARGET_TOKENS) * 100:.2f}%) | "
+            f"L4 Docs: {aggregate_lvl4:,} | L5 Docs: {aggregate_lvl5:,} | "
+            f"⏱️ Runtime: {timedelta(seconds=int(time.time() - t0))} | "
+            f"💸 Est. Cost: ${estimated_cost:.2f}"
+        )
+        sys.stdout.flush()
         
         if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
-            print(f"\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} successfully reached!")
+            print(f"\n\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} successfully reached!")
             break
             
     print("\n🏁 Distributed Processing Phase Finished.")
