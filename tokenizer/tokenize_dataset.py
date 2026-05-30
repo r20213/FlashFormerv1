@@ -30,9 +30,6 @@ image = (
 app = modal.App("mathformer-distributed-pretrain-pack", image=image)
 data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=True)
 
-# FIX: Bind a lifecycle-managed cloud Queue directly to the app instance layout
-app.global_metrics_queue = modal.Queue.ephemeral()
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker Function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,16 +42,13 @@ app.global_metrics_queue = modal.Queue.ephemeral()
 )
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
-    Independent parallel worker block. Pipes performance metrics back to the
-    orchestrator in real time using the app metric queue layout.
+    Independent parallel worker block. Uses a lightweight stream generator filter 
+    to guarantee zero row collisions based purely on explicit worker_id index mapping.
     """
     import numpy as np
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from tqdm import tqdm
-    
-    # Extract the bound queue resource straight from the active execution context
-    q = app.global_metrics_queue
     
     print(f"👷 [Worker {worker_id}/{num_workers}] Initializing tokenizer layer...")
     tokenizer = AutoTokenizer.from_pretrained(C.HUB_REPO_ID, token=os.environ["HF_TOKEN"])
@@ -67,7 +61,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
         token=os.environ["HF_TOKEN"]
     )
     
-    # Strict index extraction isolation
+    # Mathematical isolation: Ensures workers process mutually exclusive lines
     def worker_isolated_stream(iterable):
         for idx, element in enumerate(iterable):
             if idx % num_workers == worker_id:
@@ -85,7 +79,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     progress_bar = tqdm(
         dataset,
         desc=f"👷 Shard {worker_id}",
-        mininterval=15.0,
+        mininterval=15.0, # Keeps output scannable without flooding terminal frames
         unit=" rows"
     )
     
@@ -108,39 +102,32 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             enc = tokenizer(raw_text, add_special_tokens=False)
             buffer_ids.extend(enc["input_ids"])
             
+            # Flush tokens to disk at regular thresholds to preserve memory overhead
             if len(buffer_ids) >= FLUSH_THRESHOLD:
                 np_array = np.array(buffer_ids, dtype=np.uint16)
                 f_out.write(np_array.tobytes())
-                
-                # Metrics Package
-                delta_tokens = len(np_array)
-                tokens_saved_count += delta_tokens
+                tokens_saved_count += len(np_array)
                 buffer_ids.clear()
                 f_out.flush()
                 
-                # Send performance pack straight into the app loop structure
-                q.put((delta_tokens, score == 4, score == 5, False))
+                # Streaming Output tracking: Prints directly through Modal's async engine logs
+                print(f"⭐ [Progress Report] Worker {worker_id} pushed {tokens_saved_count:,} total tokens to disk storage layer.", flush=True)
                 progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
                 
         # Final residual cache sweep
         if buffer_ids:
             np_array = np.array(buffer_ids, dtype=np.uint16)
             f_out.write(np_array.tobytes())
-            delta_tokens = len(np_array)
-            tokens_saved_count += delta_tokens
+            tokens_saved_count += len(np_array)
             buffer_ids.clear()
-            q.put((delta_tokens, False, False, False))
             
-    print(f"💾 [Worker {worker_id}] Tokenization completed. Saved: {tokens_saved_count:,} tokens.")
+    print(f"💾 [Worker {worker_id}] Processing finalized cleanly. Saved: {tokens_saved_count:,} tokens.")
+    
+    # Force instant flush from container memory straight to central volume
     data_volume.commit()
     
-    # Notify main thread that this worker is completely done
-    q.put((0, 0, 0, True))
-    return tokens_saved_count
+    return tokens_saved_count, lvl4_processed, lvl5_processed
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Local Orchestration Coordinator
-# ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # Local Orchestration Coordinator
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,45 +140,28 @@ def main():
     print(f"📦 Mount Volume: {C.TOKENIZED_DATA_VOLUME}")
     print(f"📊 Extraction Matrix Target: {C.PRETRAIN_TARGET_TOKENS:,} total tokens.")
     
-    q = app.global_metrics_queue
-    
-    print("✨ Spawning workers on the cluster map layout...")
-    # FIX: Use .spawn() to force immediate non-lazy background worker execution
-    for i in range(NUM_CONCURRENT_WORKERS):
-        tokenize_dataset_shard.spawn(i, NUM_CONCURRENT_WORKERS)
+    worker_inputs = [(i, NUM_CONCURRENT_WORKERS) for i in range(NUM_CONCURRENT_WORKERS)]
     
     total_tokens_accumulated = 0
     aggregate_lvl4 = 0
     aggregate_lvl5 = 0
-    finished_workers = 0
     
-    print("🛰️ All workers activated. Listening for live token stream packets...\n")
+    print("✨ Launching 100 parallel workers across cluster matrix...\n")
     
-    # Continuous listening thread layout
-    while finished_workers < NUM_CONCURRENT_WORKERS:
-        try:
-            # Pull metrics directly as they appear from any cloud worker
-            delta_tokens, is_l4, is_l5, is_done = q.get(timeout=5)
-            
-            if is_done:
-                finished_workers += 1
-                continue
-                
-            total_tokens_accumulated += delta_tokens
-            if is_l4: aggregate_lvl4 += 1
-            if is_l5: aggregate_lvl5 += 1
-            
-            # Print feedback instantly the second ANY worker flushes data!
-            print(f"📈 Global Counter: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens | Active Workers: {NUM_CONCURRENT_WORKERS - finished_workers}/100")
-            
-            if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
-                print(f"\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} successfully reached!")
-                break
-                
-        except Exception:
-            # Keep loop alive if queue is momentarily empty
-            continue
+    # starmap returns a generator that consumes worker stdout logs on the fly
+    for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False):
+        total_tokens_accumulated += partial_count
+        aggregate_lvl4 += l4
+        aggregate_lvl5 += l5
+        
+        print(f"📈 Shard Closed. Global Counter Matrix: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens.")
+        
+        if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
+            print(f"\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} successfully reached!")
+            break
             
     print("\n🏁 Distributed Processing Phase Finished.")
     print(f"📊 Aggregate Processed Corpus Capacity: {total_tokens_accumulated:,} tokens.")
+    print(f"📈 Total Level 4 Documents Processed: {aggregate_lvl4:,}")
+    print(f"📈 Total Level 5 Documents Processed: {aggregate_lvl5:,}")
     print(f"⏱️ Matrix Run Duration: {timedelta(seconds=int(time.time() - t0))}")
