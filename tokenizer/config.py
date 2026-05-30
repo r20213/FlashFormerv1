@@ -13,7 +13,7 @@ UNICODE_NORM_FORM = "NFC"
 # Resource & Target Capacities
 VOCAB_SIZE = 16_000
 MIN_FREQUENCY = 20
-TRAIN_WORD_CAP = 5_000_000  # ~5M tokens allocation overhead
+TRAIN_WORD_CAP = 100_000_000  # ~150M tokens allocation overhead
 
 # Dataset Stream Targets
 NEMOTRON_DATASET = "nvidia/Nemotron-CC-Math-v1"
@@ -24,8 +24,8 @@ NEMOTRON_EVAL_ROWS = 8_000  # Held out validation size metrics allocation
 
 DEEPMATH_DATASET = "zwhe99/DeepMath-103K"
 DEEPMATH_SPLIT = "train"
-DEEPMATH_TEXT_COL = "text"
-DEEPMATH_AUX_COLS = ["question", "r1_solution_1"]
+DEEPMATH_TEXT_COL = None  # Multiple column concatenation strategy for question, solution, and final answer fields
+DEEPMATH_AUX_COLS = ["question", "r1_solution_1","final_answer"]
 DEEPMATH_EVAL_ROWS = 2_000
 
 # Directory Resolution Ecosystem Locations
