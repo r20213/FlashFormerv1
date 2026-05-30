@@ -166,6 +166,9 @@ def main():
         eos_piece=C.EOS_TOKEN,
         pad_piece=C.PAD_TOKEN,
         character_coverage=1.0,                 # Ensures no math symbol is dropped as an outlier
+        max_sentence_length=100000,             # 👈 Stops skipping long math blocks
+        hard_vocab_limit=False,                 # 👈 Prevents crash if pool under-runs
+        byte_fallback=True
     )
     log.info("✓ Native SentencePiece training cycle complete.")
 
