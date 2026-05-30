@@ -21,23 +21,23 @@ HUB_COMMIT_MESSAGE = "MathFormer v1 — 16K math-specialized BPE tokenizer"
 # ---------------------------------------------------------------------------
 
 VOCAB_SIZE = 16_000          # Hard ceiling. BPE will stop at or before this.
-MIN_FREQUENCY = 2            # Minimum pair frequency to merge.
+MIN_FREQUENCY = 10            # Minimum pair frequency to merge.
 
 # ---------------------------------------------------------------------------
 # Training-corpus budget
 # ---------------------------------------------------------------------------
 
-TOK_TRAIN_TOKEN_BUDGET = 150_000_000    # 150 M tokens for tokenizer training
-EVAL_TOKEN_BUDGET      =  10_000_000    # 10 M held-out tokens for evaluation
+TOK_TRAIN_TOKEN_BUDGET = 20_000_000    # 20 M tokens for tokenizer training
+EVAL_TOKEN_BUDGET      =  1_000_000    # 1 M held-out tokens for evaluation
 
 # Row-level sample caps (approximate — exact token count validated post-sample)
-NEMOTRON_TRAIN_ROWS =  600_000   # ~120 tokens/row avg → ~72M tokens
-DEEPMATH_TRAIN_ROWS =   85_000   # ~250 tokens/row avg → ~21M tokens
+NEMOTRON_TRAIN_ROWS =  100_000   # ~120 tokens/row avg → ~72M tokens
+DEEPMATH_TRAIN_ROWS =   50_000   # ~250 tokens/row avg → ~21M tokens
 # Remaining budget filled by a second Nemotron pass if needed.
 
 # Held-out eval rows (completely disjoint from training rows above)
-NEMOTRON_EVAL_ROWS  =   50_000
-DEEPMATH_EVAL_ROWS  =   10_000
+NEMOTRON_EVAL_ROWS  =   10_000
+DEEPMATH_EVAL_ROWS  =   5_000
 
 RANDOM_SEED = 42
 
