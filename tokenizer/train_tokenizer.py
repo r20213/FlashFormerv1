@@ -164,7 +164,7 @@ def main():
         eos_piece=C.EOS_TOKEN,
         pad_piece=C.PAD_TOKEN,
         character_coverage=1.0,
-        max_sentence_length=500000,
+        max_sentence_length=100000,
         hard_vocab_limit=False,
         byte_fallback=False,
         
