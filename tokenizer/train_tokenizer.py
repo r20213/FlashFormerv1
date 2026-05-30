@@ -7,7 +7,7 @@ reference tokenizers on a held-out 10M-token set and a
 deterministic stress-test suite, then pushes to HF Hub.
 
 Hardware target : 4 vCPUs, 27 GB RAM (Modal CPU worker)
-Runtime estimate: ~25–40 minutes end-to-end
+Runtime estimate: ~1.5–2 hours end-to-end
 
 Usage
 -----
@@ -29,19 +29,19 @@ import time
 import random
 import unicodedata
 import logging
-from collections import defaultdict
+import contextlib
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterator, List, Dict, Tuple, Optional
 
 import numpy as np
-from datasets import load_dataset, Dataset
-from tokenizers import Tokenizer, pre_tokenizers, normalizers, trainers
+from datasets import load_dataset
+from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.normalizers import NFC, Strip, Replace, Sequence as NormSequence
-from tokenizers.pre_tokenizers import Split, Sequence as PreTokSequence
+from tokenizers.pre_tokenizers import Split
 from tokenizers.trainers import BpeTrainer
 from transformers import PreTrainedTokenizerFast
-from huggingface_hub import HfApi
 
 import config as C
 
@@ -58,7 +58,6 @@ log = logging.getLogger("mathformer")
 
 
 def _require_env(var: str) -> str:
-    """Exit immediately if a required env var is missing."""
     val = os.environ.get(var, "").strip()
     if not val:
         log.error(
@@ -71,10 +70,10 @@ def _require_env(var: str) -> str:
 
 HF_TOKEN = _require_env("HF_TOKEN")
 
-# Resolve paths: prefer Modal volume mounts when they exist
-_on_modal = Path(C.MODAL_VOLUME_MOUNT).exists()
-DATA_DIR   = C.MODAL_DATA_DIR   if _on_modal else C.DATA_DIR
-TOK_DIR    = C.MODAL_TOK_DIR    if _on_modal else C.TOKENIZER_DIR
+# ── Resolve paths: prefer Modal volume mounts when present ───
+_on_modal    = Path(C.MODAL_VOLUME_MOUNT).exists()
+DATA_DIR     = C.MODAL_DATA_DIR     if _on_modal else C.DATA_DIR
+TOK_DIR      = C.MODAL_TOK_DIR      if _on_modal else C.TOKENIZER_DIR
 CORPUS_TRAIN = C.MODAL_CORPUS_TRAIN if _on_modal else C.CORPUS_TRAIN_PATH
 CORPUS_EVAL  = C.MODAL_CORPUS_EVAL  if _on_modal else C.CORPUS_EVAL_PATH
 TOK_JSON     = C.MODAL_TOK_JSON     if _on_modal else C.TOKENIZER_JSON_PATH
@@ -84,12 +83,45 @@ TOK_DIR.mkdir(parents=True, exist_ok=True)
 
 rng = random.Random(C.RANDOM_SEED)
 
+# ── Corpus size cap ──────────────────────────────────────────
+# 120M whitespace-words ≈ 150M real BPE tokens after fragmentation.
+# Keeps the corpus file under ~1.5 GB so BPE trainer stays in RAM.
+TRAIN_WORD_CAP = 120_000_000
+
 
 # ─────────────────────────────────────────────────────────────
-# 1. Text normalisation  (Python-side, before corpus write)
+# 1. Timer utility
 # ─────────────────────────────────────────────────────────────
 
-# Unicode "other space" characters that are not ASCII 0x20
+@contextlib.contextmanager
+def timer(label: str):
+    """Wall-clock timer. Logs start, end, and elapsed H:MM:SS."""
+    log.info(f"⏱  [{label}] starting …")
+    t0 = time.time()
+    try:
+        yield
+    finally:
+        elapsed = time.time() - t0
+        td = timedelta(seconds=int(elapsed))
+        log.info(f"✓  [{label}] done in {td} ({elapsed:.1f}s)")
+
+
+def _log_memory(label: str = "") -> None:
+    try:
+        import psutil
+        proc  = psutil.Process()
+        rss   = proc.memory_info().rss / 1024**3
+        avail = psutil.virtual_memory().available / 1024**3
+        tag   = f" [{label}]" if label else ""
+        log.info(f"  RAM{tag}: {rss:.2f}GB RSS used, {avail:.2f}GB available")
+    except ImportError:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. Text normalisation
+# ─────────────────────────────────────────────────────────────
+
 _UNICODE_SPACES = re.compile(
     r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]"
 )
@@ -98,43 +130,22 @@ _MULTI_BLANK = re.compile(r"\n{3,}")
 
 def normalize_text(text: str) -> str:
     """
-    Normalisation pipeline applied to every document before it is written
-    to the training corpus file.
-
-    Steps (order is deliberate):
-    1. NFC Unicode normalisation — composes combining characters.
-       NOT NFKC: we preserve LaTeX ligatures and special forms.
+    Normalisation pipeline (order is deliberate):
+    1. NFC  — compose combining characters. NOT NFKC (preserves LaTeX forms).
     2. Replace exotic Unicode spaces with ASCII 0x20.
-    3. Collapse runs of 3+ consecutive blank lines to exactly 2.
-    4. Strip leading/trailing whitespace from the document.
-
-    We do NOT lowercase (math is case-sensitive: x ≠ X, A ≠ a).
-    We do NOT remove punctuation or symbols.
+    3. Collapse 3+ consecutive blank lines to exactly 2.
+    4. Strip leading/trailing whitespace.
+    No lowercasing — math is case-sensitive (x ≠ X).
     """
     if not text:
         return ""
-
-    # Step 1 — NFC
     text = unicodedata.normalize(C.UNICODE_NORM_FORM, text)
-
-    # Step 2 — exotic spaces → ASCII space
     text = _UNICODE_SPACES.sub(" ", text)
-
-    # Step 3 — collapse excessive blank lines
     text = _MULTI_BLANK.sub("\n\n", text)
-
-    # Step 4 — strip
-    text = text.strip()
-
-    return text
+    return text.strip()
 
 
 def build_deepmath_text(row: dict) -> str:
-    """
-    Concatenate question + solution for DeepMath rows.
-    A blank line separates them so the tokenizer sees natural
-    question/answer structure without a special delimiter.
-    """
     parts = [row.get(C.DEEPMATH_TEXT_COL, "")]
     for col in C.DEEPMATH_AUX_COLS:
         val = row.get(col, "") or ""
@@ -143,27 +154,18 @@ def build_deepmath_text(row: dict) -> str:
     return "\n\n".join(p for p in parts if p.strip())
 
 
-# ─────────────────────────────────────────────────────────────
-# 2. Dataset streaming + corpus file construction
-# ─────────────────────────────────────────────────────────────
-
 def _approx_token_count(text: str) -> int:
-    """
-    Whitespace-split word count as a cheap proxy for token count during
-    corpus construction. The real token count is measured post-training.
-    """
     return len(text.split())
 
+
+# ─────────────────────────────────────────────────────────────
+# 3. Dataset streamers
+# ─────────────────────────────────────────────────────────────
 
 def stream_nemotron(
     n_rows: int,
     skip_indices: Optional[set] = None,
 ) -> Iterator[str]:
-    """
-    Stream `n_rows` random rows from Nemotron-CC-Math-v1 (4plus subset).
-    `skip_indices` is a set of row indices reserved for eval — these are
-    never yielded by the training streamer and vice versa.
-    """
     log.info(f"Streaming {n_rows:,} rows from Nemotron …")
     ds = load_dataset(
         C.NEMOTRON_DATASET,
@@ -179,7 +181,7 @@ def stream_nemotron(
         if collected >= n_rows:
             break
         text = normalize_text(row.get(C.NEMOTRON_TEXT_COL, "") or "")
-        if len(text) > 50:          # skip near-empty rows
+        if len(text) > 50:
             yield text
             collected += 1
     log.info(f"  → yielded {collected:,} Nemotron rows")
@@ -190,40 +192,46 @@ def stream_deepmath(
     skip_indices: Optional[set] = None,
 ) -> Iterator[str]:
     """
-    Stream `n_rows` rows from DeepMath-103K.
-    DeepMath is small enough to load fully into memory.
+    DeepMath is only 103K rows — small enough to load fully, but we
+    use streaming=True to avoid the Arrow in-memory overhead that
+    caused the OOM in the previous run.
     """
-    log.info(f"Loading DeepMath ({n_rows:,} rows requested) …")
+    log.info(f"Streaming DeepMath ({n_rows:,} rows requested) …")
     ds = load_dataset(
         C.DEEPMATH_DATASET,
         split=C.DEEPMATH_SPLIT,
+        streaming=True,
         token=HF_TOKEN,
     )
-    all_indices = list(range(len(ds)))
-    rng.shuffle(all_indices)
-
+    # Streaming datasets support buffer-based shuffle
+    ds = ds.shuffle(seed=C.RANDOM_SEED, buffer_size=10_000)
     collected = 0
-    for idx in all_indices:
+    for idx, row in enumerate(ds):
         if skip_indices and idx in skip_indices:
             continue
         if collected >= n_rows:
             break
-        text = normalize_text(build_deepmath_text(ds[idx]))
+        text = normalize_text(build_deepmath_text(row))
         if len(text) > 50:
             yield text
             collected += 1
     log.info(f"  → yielded {collected:,} DeepMath rows")
-    del ds; gc.collect()
 
+
+# ─────────────────────────────────────────────────────────────
+# 4. Corpus file construction
+# ─────────────────────────────────────────────────────────────
 
 def build_corpus_files() -> None:
     """
-    Write CORPUS_TRAIN and CORPUS_EVAL.
-    Each file contains one document per line (empty line between docs
-    is handled by the trainer's iterator).
+    Write CORPUS_TRAIN and CORPUS_EVAL (one document per line).
 
-    Eval rows are drawn FIRST so their indices can be passed as
-    `skip_indices` to the training streamers, guaranteeing zero overlap.
+    Key changes vs v1:
+    - TRAIN_WORD_CAP hard-stops corpus at ~120M words (~1.5GB file)
+      so BPE trainer never exceeds available RAM.
+    - DeepMath now uses streaming=True (see stream_deepmath) to avoid
+      loading the full Arrow table into memory.
+    - File-size warning fires at >2GB.
     """
     if CORPUS_TRAIN.exists() and CORPUS_EVAL.exists():
         log.info("Corpus files already exist — skipping rebuild.")
@@ -232,13 +240,13 @@ def build_corpus_files() -> None:
     log.info("═" * 60)
     log.info("Building corpus files …")
     log.info("═" * 60)
+    _log_memory("corpus-start")
+
+    # Eval rows come from the first N indices — training skips these.
+    nemotron_eval_skip = set(range(C.NEMOTRON_EVAL_ROWS))
+    deepmath_eval_skip = set(range(C.DEEPMATH_EVAL_ROWS))
 
     # ── Eval corpus ──────────────────────────────────────────
-    # Reserve a contiguous block of the FIRST N rows for eval
-    # (deterministic with fixed seed).
-    nemotron_eval_skip  = set(range(C.NEMOTRON_EVAL_ROWS))
-    deepmath_eval_skip  = set(range(C.DEEPMATH_EVAL_ROWS))
-
     log.info("Writing eval corpus …")
     eval_tokens = 0
     with open(CORPUS_EVAL, "w", encoding="utf-8") as f:
@@ -250,133 +258,114 @@ def build_corpus_files() -> None:
         for text in stream_deepmath(C.DEEPMATH_EVAL_ROWS, skip_indices=None):
             f.write(text + "\n")
             eval_tokens += _approx_token_count(text)
-
-    log.info(f"  Eval corpus: ~{eval_tokens:,} whitespace-tokens written")
+    log.info(f"  Eval corpus: ~{eval_tokens:,} whitespace-words")
 
     # ── Train corpus ─────────────────────────────────────────
-    log.info("Writing train corpus …")
+    log.info(f"Writing train corpus (cap: {TRAIN_WORD_CAP:,} words) …")
     train_tokens = 0
+
     with open(CORPUS_TRAIN, "w", encoding="utf-8") as f:
+
         for text in stream_nemotron(
             C.NEMOTRON_TRAIN_ROWS,
             skip_indices=nemotron_eval_skip,
         ):
             f.write(text + "\n")
             train_tokens += _approx_token_count(text)
+            if train_tokens >= TRAIN_WORD_CAP:
+                log.info("  Train word cap reached during Nemotron stream.")
+                break
 
-        for text in stream_deepmath(
-            C.DEEPMATH_TRAIN_ROWS,
-            skip_indices=deepmath_eval_skip,
-        ):
-            f.write(text + "\n")
-            train_tokens += _approx_token_count(text)
+        if train_tokens < TRAIN_WORD_CAP:
+            for text in stream_deepmath(
+                C.DEEPMATH_TRAIN_ROWS,
+                skip_indices=deepmath_eval_skip,
+            ):
+                f.write(text + "\n")
+                train_tokens += _approx_token_count(text)
+                if train_tokens >= TRAIN_WORD_CAP:
+                    log.info("  Train word cap reached during DeepMath stream.")
+                    break
 
-    log.info(f"  Train corpus: ~{train_tokens:,} whitespace-tokens written")
+    size_gb = os.path.getsize(CORPUS_TRAIN) / 1024**3
+    log.info(f"  Train corpus: ~{train_tokens:,} whitespace-words | {size_gb:.2f} GB")
+
+    if size_gb > 2.0:
+        log.warning(
+            f"Corpus is {size_gb:.2f} GB — high OOM risk during BPE training. "
+            f"Reduce TRAIN_WORD_CAP in train_tokenizer.py and re-run."
+        )
+
+    _log_memory("corpus-end")
     log.info("Corpus files ready.")
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. Tokenizer construction
+# 5. Tokenizer construction & training
 # ─────────────────────────────────────────────────────────────
 
 def build_tokenizer() -> Tokenizer:
     """
-    Construct the HuggingFace `tokenizers` Tokenizer object with:
+    Normaliser  : NFC → Strip → exotic-space replacements
+    Pre-tokeniser: Regex Split (isolated) using config.PRETOKENIZER_REGEX
 
-    Normaliser stack
-    ────────────────
-    1. NFC             — Unicode composition (tokenizers-native)
-    2. Strip           — strip leading/trailing whitespace
-    3. Replace(exotic Unicode spaces → ASCII space)
+    Regex alternation order guarantees:
+      1. Whitespace  → always its own isolated piece
+      2. LaTeX cmds  → \frac, \alpha, etc. as one piece
+      3. Digits      → one piece per digit (123 → ['1','2','3'])
+      4. Alpha runs  → no digit contamination
+      5. Operators   → one piece each
+      6. Brackets    → one piece each
+      7. Fallthrough → any remaining Unicode char
 
-    Pre-tokeniser
-    ─────────────
-    A single Regex Split pre-tokeniser using the pattern defined in
-    config.PRETOKENIZER_REGEX.
-
-    Behaviour guaranteed by the regex alternation order:
-      • Whitespace runs  → own isolated piece (never merged into a word)
-      • LaTeX commands   → single piece (\frac, \alpha, …)
-      • Digits           → one piece per digit (123 → ['1','2','3'])
-      • Alpha runs       → pure letter sequences (no embedded digits)
-      • Operators        → one piece each (+, -, =, ≤, …)
-      • Brackets/punct   → one piece each
-      • Fallthrough      → any remaining unicode char
-
-    This means BPE only ever merges within a pre-tokenised piece boundary.
-    A space can NEVER be merged with adjacent letters. '3' can NEVER be
-    merged with 'x'. \frac will always be one unit unless BPE splits it
-    further (it won't — it appears as one pre-token from the start).
-
-    Model
-    ─────
-    BPE (byte-level fallback disabled — we rely on the catch-all regex
-    branch to handle unknown Unicode rather than byte fallback, which
-    would pollute the vocab with noise bytes).
+    BPE can only merge within pre-token boundaries, so spaces never
+    attach to words and digits never attach to letters.
     """
     tokenizer = Tokenizer(BPE(unk_token=C.UNK_TOKEN))
 
-    # ── Normaliser ───────────────────────────────────────────
     tokenizer.normalizer = NormSequence([
         NFC(),
         Strip(),
-        # U+00A0 non-breaking space → regular space
-        Replace("\u00a0", " "),
-        # Hair space, thin space, em space, etc.
-        Replace("\u2009", " "),
-        Replace("\u202f", " "),
-        Replace("\u2003", " "),
-        Replace("\u2002", " "),
-        Replace("\u200b", ""),   # zero-width space → remove entirely
-        Replace("\ufeff", ""),   # BOM → remove
+        Replace("\u00a0", " "),   # non-breaking space
+        Replace("\u2009", " "),   # thin space
+        Replace("\u202f", " "),   # narrow no-break space
+        Replace("\u2003", " "),   # em space
+        Replace("\u2002", " "),   # en space
+        Replace("\u200b", ""),    # zero-width space → remove
+        Replace("\ufeff", ""),    # BOM → remove
     ])
 
-    # ── Pre-tokeniser ────────────────────────────────────────
-    # Split behaviour = ISOLATED: each captured group is its own piece.
-    # The whitespace group is included in the output (not removed) so
-    # the model sees whitespace as first-class tokens.
     tokenizer.pre_tokenizer = Split(
         pattern=C.PRETOKENIZER_REGEX,
-        behavior="isolated",     # every match + every non-match = own piece
+        behavior="isolated",
     )
 
     return tokenizer
 
 
 def train_tokenizer(tokenizer: Tokenizer) -> Tokenizer:
-    """
-    Run BPE training on the corpus file.
-    Uses all 4 vCPUs via the tokenizers library's internal parallelism.
-    """
+    # RAYON_NUM_THREADS must be set before the Rust thread pool
+    # initialises — set it here as a safety net (shell export is primary).
+    os.environ.setdefault("RAYON_NUM_THREADS", str(os.cpu_count() or 4))
+    log.info(f"RAYON_NUM_THREADS = {os.environ['RAYON_NUM_THREADS']}")
+
     trainer = BpeTrainer(
         vocab_size=C.VOCAB_SIZE,
         min_frequency=C.MIN_FREQUENCY,
         special_tokens=C.SPECIAL_TOKENS,
         show_progress=True,
-        # Do not limit initial alphabet — let all Unicode chars in corpus
-        # seed the initial vocabulary before BPE merges begin.
         initial_alphabet=[],
-        # Byte fallback disabled: unknown chars map to <unk> via the
-        # catch-all regex branch, not to byte sequences.
         continuing_subword_prefix="##",
         end_of_word_suffix="",
     )
 
     log.info("Starting BPE training …")
-    t0 = time.time()
     tokenizer.train(files=[str(CORPUS_TRAIN)], trainer=trainer)
-    elapsed = time.time() - t0
-    log.info(f"BPE training complete in {elapsed:.1f}s")
     log.info(f"Final vocab size: {tokenizer.get_vocab_size():,}")
-
     return tokenizer
 
 
 def wrap_as_fast_tokenizer(tokenizer: Tokenizer) -> PreTrainedTokenizerFast:
-    """
-    Wrap the low-level Tokenizer in a PreTrainedTokenizerFast so it can
-    be pushed to the Hub and used with transformers pipelines.
-    """
     fast = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         unk_token=C.UNK_TOKEN,
@@ -384,11 +373,9 @@ def wrap_as_fast_tokenizer(tokenizer: Tokenizer) -> PreTrainedTokenizerFast:
         eos_token=C.EOS_TOKEN,
         pad_token=C.PAD_TOKEN,
         model_max_length=4096,
-        # Padding strategy — right-pad by default
         padding_side="right",
         truncation_side="right",
     )
-    # Register all special tokens so they're never split
     fast.add_special_tokens({
         "additional_special_tokens": [
             t for t in C.SPECIAL_TOKENS
@@ -399,17 +386,13 @@ def wrap_as_fast_tokenizer(tokenizer: Tokenizer) -> PreTrainedTokenizerFast:
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. Evaluation helpers
+# 6. Evaluation
 # ─────────────────────────────────────────────────────────────
 
 def _encode(tokenizer, text: str) -> List[int]:
-    """Unified encode interface for both fast and slow tokenizers."""
     if hasattr(tokenizer, "encode"):
         result = tokenizer.encode(text)
-        if isinstance(result, list):
-            return result
-        # tokenizers.Encoding object
-        return result.ids
+        return result if isinstance(result, list) else result.ids
     return tokenizer(text)["input_ids"]
 
 
@@ -419,26 +402,15 @@ def corpus_metrics(
     corpus_path: Path,
     max_docs: int = 50_000,
 ) -> Dict[str, float]:
-    """
-    Compute fertility, continued-word %, unknown-token rate, and
-    math-symbol coverage over the held-out eval corpus.
+    log.info(f"  Corpus metrics [{name}] …")
 
-    Reads at most `max_docs` lines to keep runtime bounded.
-    """
-    log.info(f"  Running corpus metrics for [{name}] …")
+    total_words = total_tokens = unk_count = continued = 0
+    math_ops_seen: set = set()
+    math_ops_as_single: set = set()
 
-    total_words   = 0
-    total_tokens  = 0
-    unk_count     = 0
-    continued     = 0
-    math_ops_seen = set()
-    math_ops_as_single = set()
-
-    # Build unk id
     unk_id = None
     try:
-        vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
-        unk_id = vocab.get(C.UNK_TOKEN)
+        unk_id = (tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}).get(C.UNK_TOKEN)
     except Exception:
         pass
 
@@ -449,24 +421,17 @@ def corpus_metrics(
             line = line.strip()
             if not line:
                 continue
-
-            words  = line.split()
-            ids    = _encode(tokenizer, line)
-
+            words = line.split()
+            ids   = _encode(tokenizer, line)
             total_words  += len(words)
             total_tokens += len(ids)
-
             if unk_id is not None:
                 unk_count += ids.count(unk_id)
-
-            # Continued words (## prefix convention)
             try:
                 conv = tokenizer.convert_ids_to_tokens(ids)
                 continued += sum(1 for t in conv if t and t.startswith("##"))
             except Exception:
                 pass
-
-            # Math operator coverage
             for op in C.MATH_OPERATORS_CORPUS:
                 if op in line:
                     math_ops_seen.add(op)
@@ -477,17 +442,17 @@ def corpus_metrics(
                     except Exception:
                         pass
 
-    fertility  = total_tokens / max(total_words, 1)
-    pcw        = continued / max(total_tokens, 1)
-    unk_rate   = unk_count  / max(total_tokens, 1)
-    math_cov   = (len(math_ops_as_single) / max(len(math_ops_seen), 1)
-                  if math_ops_seen else float("nan"))
+    fertility = total_tokens / max(total_words, 1)
+    pcw       = continued   / max(total_tokens, 1)
+    unk_rate  = unk_count   / max(total_tokens, 1)
+    math_cov  = (len(math_ops_as_single) / max(len(math_ops_seen), 1)
+                 if math_ops_seen else float("nan"))
 
     return {
-        "fertility":             round(fertility, 4),
-        "continued_word_pct":   round(pcw * 100, 2),
-        "unk_rate":              round(unk_rate * 100, 4),
-        "math_symbol_coverage": round(math_cov * 100, 2),
+        "fertility":             round(fertility,       4),
+        "continued_word_pct":   round(pcw      * 100,  2),
+        "unk_rate":              round(unk_rate * 100,  4),
+        "math_symbol_coverage": round(math_cov * 100,  2),
         "vocab_size":           (tokenizer.get_vocab_size()
                                   if hasattr(tokenizer, "get_vocab_size")
                                   else len(tokenizer.get_vocab())),
@@ -495,86 +460,44 @@ def corpus_metrics(
 
 
 def stress_test(tokenizer, name: str) -> Dict[str, float]:
-    """
-    Deterministic stress-test suite against curated probe sets.
-
-    Metrics
-    ───────
-    digit_integrity_rate    — fraction of individual digits that map to
-                              exactly one token ID (target: 1.0)
-    arithmetic_readiness    — mean tokens per multi-digit number
-                              (target: equals digit count of the number)
-    strr                    — single-token retention rate for LaTeX
-                              commands: fraction that tokenise as 1 token
-    pcw_numbers             — fraction of multi-digit numbers fragmented
-                              across >1 token boundary (lower is NOT
-                              necessarily better — we WANT fragmentation;
-                              this just confirms it happens consistently)
-    cpt_expressions         — chars per token on pure math expressions
-                              (higher = more efficient compression)
-    """
-    log.info(f"  Running stress-test for [{name}] …")
+    log.info(f"  Stress-test [{name}] …")
 
     try:
         unk_id = tokenizer.get_vocab().get(C.UNK_TOKEN)
     except Exception:
         unk_id = None
 
-    # ── Digit integrity ─────────────────────────────────────
-    digit_pass = 0
-    for d in C.PROBE_DIGITS:
-        ids = _encode(tokenizer, d)
-        if len(ids) == 1 and ids[0] != unk_id:
-            digit_pass += 1
+    # Digit integrity
+    digit_pass = sum(
+        1 for d in C.PROBE_DIGITS
+        if len(_encode(tokenizer, d)) == 1 and _encode(tokenizer, d)[0] != unk_id
+    )
     digit_integrity = digit_pass / len(C.PROBE_DIGITS)
 
-    # ── Arithmetic readiness ─────────────────────────────────
-    token_counts_per_number = []
-    fragmented_numbers = 0
-    for num_str in C.PROBE_NUMBERS:
-        # Strip sign and decimal point — count pure digit chars
-        digit_chars = sum(1 for c in num_str if c.isdigit())
-        ids = _encode(tokenizer, num_str)
-        n_toks = len(ids)
-        token_counts_per_number.append(n_toks)
-        if n_toks > 1:
-            fragmented_numbers += 1   # multi-digit numbers SHOULD fragment
+    # Arithmetic readiness + PCW for numbers
+    tok_counts = [len(_encode(tokenizer, n)) for n in C.PROBE_NUMBERS]
+    arith_readiness = float(np.mean(tok_counts))
+    multi = [n for n in C.PROBE_NUMBERS if sum(c.isdigit() for c in n) > 1]
+    pcw_numbers = sum(1 for n in multi if len(_encode(tokenizer, n)) > 1) / max(len(multi), 1)
 
-    arith_readiness = float(np.mean(token_counts_per_number))
-    # For PCW-numbers we report what fraction of multi-digit numbers
-    # were correctly fragmented (≥2 tokens)
-    multi_digit_numbers = [n for n in C.PROBE_NUMBERS if sum(c.isdigit() for c in n) > 1]
-    pcw_numbers_correct = 0
-    for num_str in multi_digit_numbers:
-        ids = _encode(tokenizer, num_str)
-        if len(ids) > 1:
-            pcw_numbers_correct += 1
-    pcw_numbers = pcw_numbers_correct / max(len(multi_digit_numbers), 1)
-
-    # ── Single-token retention rate (LaTeX commands) ─────────
-    strr_pass = 0
-    for cmd in C.PROBE_LATEX_COMMANDS:
-        ids = _encode(tokenizer, cmd)
-        if len(ids) == 1 and ids[0] != unk_id:
-            strr_pass += 1
+    # Single-token retention rate — LaTeX commands
+    strr_pass = sum(
+        1 for cmd in C.PROBE_LATEX_COMMANDS
+        if len(_encode(tokenizer, cmd)) == 1 and _encode(tokenizer, cmd)[0] != unk_id
+    )
     strr = strr_pass / len(C.PROBE_LATEX_COMMANDS)
 
-    # ── Chars per token on math expressions ─────────────────
-    total_chars  = 0
-    total_etokens = 0
-    for expr in C.PROBE_EXPRESSIONS:
-        clean = expr.replace(" ", "")   # strip spaces for pure density
-        ids = _encode(tokenizer, expr)
-        total_chars   += len(clean)
-        total_etokens += len(ids)
-    cpt = total_chars / max(total_etokens, 1)
+    # Chars per token on math expressions
+    total_chars = sum(len(e.replace(" ", "")) for e in C.PROBE_EXPRESSIONS)
+    total_etoks = sum(len(_encode(tokenizer, e)) for e in C.PROBE_EXPRESSIONS)
+    cpt = total_chars / max(total_etoks, 1)
 
     return {
-        "digit_integrity_rate":    round(digit_integrity  * 100, 2),
-        "arithmetic_readiness_mean_toks": round(arith_readiness, 3),
-        "strr_latex_pct":          round(strr * 100, 2),
-        "pcw_numbers_fragmented_pct": round(pcw_numbers * 100, 2),
-        "cpt_expressions":         round(cpt, 3),
+        "digit_integrity_rate":           round(digit_integrity * 100, 2),
+        "arithmetic_readiness_mean_toks": round(arith_readiness,       3),
+        "strr_latex_pct":                 round(strr            * 100, 2),
+        "pcw_numbers_fragmented_pct":     round(pcw_numbers     * 100, 2),
+        "cpt_expressions":                round(cpt,                   3),
     }
 
 
@@ -582,43 +505,56 @@ def run_full_evaluation(
     our_tokenizer: PreTrainedTokenizerFast,
 ) -> Tuple[Dict, Dict]:
     """
-    Evaluate MathFormer + all reference tokenizers.
-    Returns (corpus_results, stress_results) dicts keyed by model name.
+    Evaluate MathFormer then each reference tokenizer.
+    Each reference is loaded, evaluated, then explicitly freed before
+    the next one loads — prevents cumulative RAM growth that caused OOM.
     """
+    from transformers import AutoTokenizer
+
     log.info("═" * 60)
     log.info("Running full evaluation …")
     log.info("═" * 60)
 
-    all_corpus  = {}
-    all_stress  = {}
+    all_corpus: Dict = {}
+    all_stress: Dict = {}
 
-    # ── Our tokenizer ─────────────────────────────────────────
-    all_corpus["MathFormer"] = corpus_metrics(
-        our_tokenizer.backend_tokenizer, "MathFormer", CORPUS_EVAL
-    )
-    all_stress["MathFormer"] = stress_test(
-        our_tokenizer.backend_tokenizer, "MathFormer"
-    )
+    # ── MathFormer (already in memory) ───────────────────────
+    with timer("Eval MathFormer"):
+        all_corpus["MathFormer"] = corpus_metrics(
+            our_tokenizer.backend_tokenizer, "MathFormer", CORPUS_EVAL
+        )
+        all_stress["MathFormer"] = stress_test(
+            our_tokenizer.backend_tokenizer, "MathFormer"
+        )
 
-    # ── Reference tokenizers ──────────────────────────────────
+    # Free our tokenizer before loading large reference models
+    del our_tokenizer
+    gc.collect()
+    _log_memory("after-MathFormer-eval")
+
+    # ── Reference tokenizers — one at a time ─────────────────
     for display_name, hf_id in C.REFERENCE_TOKENIZERS:
-        log.info(f"Loading reference tokenizer: {hf_id}")
-        try:
-            from transformers import AutoTokenizer
-            ref_tok = AutoTokenizer.from_pretrained(
-                hf_id, token=HF_TOKEN, trust_remote_code=True
-            )
-            # Corpus metrics — use the fast backend if available
-            backend = getattr(ref_tok, "_tokenizer", None) or ref_tok
-            all_corpus[display_name] = corpus_metrics(
-                backend, display_name, CORPUS_EVAL
-            )
-            all_stress[display_name] = stress_test(backend, display_name)
-            del ref_tok; gc.collect()
-        except Exception as e:
-            log.warning(f"  Could not load {hf_id}: {e}")
-            all_corpus[display_name] = {"error": str(e)}
-            all_stress[display_name] = {"error": str(e)}
+        with timer(f"Eval {display_name}"):
+            ref_tok = backend = None
+            try:
+                log.info(f"  Loading {hf_id} …")
+                ref_tok = AutoTokenizer.from_pretrained(
+                    hf_id, token=HF_TOKEN, trust_remote_code=True
+                )
+                backend = getattr(ref_tok, "_tokenizer", None) or ref_tok
+                all_corpus[display_name] = corpus_metrics(
+                    backend, display_name, CORPUS_EVAL
+                )
+                all_stress[display_name] = stress_test(backend, display_name)
+            except Exception as e:
+                log.warning(f"  Could not load {hf_id}: {e}")
+                all_corpus[display_name] = {"error": str(e)}
+                all_stress[display_name] = {"error": str(e)}
+            finally:
+                # Always free — even on exception
+                del ref_tok, backend
+                gc.collect()
+                _log_memory(f"after-{display_name}")
 
     return all_corpus, all_stress
 
@@ -627,8 +563,6 @@ def print_results_table(
     corpus_results: Dict[str, Dict],
     stress_results: Dict[str, Dict],
 ) -> None:
-    """Pretty-print evaluation tables to stdout."""
-
     CORPUS_COLS = [
         ("fertility",             "Fertility↓"),
         ("continued_word_pct",   "Cont.Word%↓"),
@@ -637,11 +571,11 @@ def print_results_table(
         ("vocab_size",            "Vocab"),
     ]
     STRESS_COLS = [
-        ("digit_integrity_rate",         "Digit Integrity%↑"),
+        ("digit_integrity_rate",          "Digit Integrity%↑"),
         ("arithmetic_readiness_mean_toks","ArithReady(toks)↓"),
-        ("strr_latex_pct",               "STRR LaTeX%↑"),
-        ("pcw_numbers_fragmented_pct",   "NumFrag%↑"),
-        ("cpt_expressions",              "CPT Expr↑"),
+        ("strr_latex_pct",                "STRR LaTeX%↑"),
+        ("pcw_numbers_fragmented_pct",    "NumFrag%↑"),
+        ("cpt_expressions",               "CPT Expr↑"),
     ]
 
     def _fmt(v) -> str:
@@ -650,47 +584,40 @@ def print_results_table(
         return str(v)
 
     def _table(results, cols, title):
-        names = list(results.keys())
         header = f"{'Model':<26}" + "".join(f"{h:<22}" for _, h in cols)
-        print(f"\n{'═'*80}")
+        print(f"\n{'═'*90}")
         print(f"  {title}")
-        print('═'*80)
+        print("═" * 90)
         print(header)
-        print('─'*80)
-        for name in names:
-            row = results[name]
+        print("─" * 90)
+        for name, row in results.items():
             line = f"{name:<26}"
             for key, _ in cols:
-                val = row.get(key, "—")
-                line += f"{_fmt(val):<22}"
+                line += f"{_fmt(row.get(key, '—')):<22}"
             print(line)
-        print('─'*80)
+        print("─" * 90)
 
-    _table(corpus_results, CORPUS_COLS,  "A. Corpus Metrics (held-out 10M tokens)")
-    _table(stress_results, STRESS_COLS,  "B. Stress-Test Suite (deterministic probes)")
+    _table(corpus_results, CORPUS_COLS, "A. Corpus Metrics (held-out eval set)")
+    _table(stress_results, STRESS_COLS, "B. Stress-Test Suite (deterministic probes)")
     print()
 
 
-def save_results(
-    corpus_results: Dict,
-    stress_results: Dict,
-) -> None:
-    out = {
-        "corpus_metrics": corpus_results,
-        "stress_test":    stress_results,
-    }
+def save_results(corpus_results: Dict, stress_results: Dict) -> None:
     path = TOK_DIR / "evaluation_results.json"
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
-    log.info(f"Evaluation results saved to {path}")
+        json.dump(
+            {"corpus_metrics": corpus_results, "stress_test": stress_results},
+            f, indent=2, ensure_ascii=False,
+        )
+    log.info(f"Evaluation results → {path}")
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. Hub push
+# 7. Hub push
 # ─────────────────────────────────────────────────────────────
 
 def push_to_hub(fast_tokenizer: PreTrainedTokenizerFast) -> None:
-    log.info(f"Pushing tokenizer to Hub: {C.HUB_REPO_ID} …")
+    log.info(f"Pushing to Hub: {C.HUB_REPO_ID} …")
     fast_tokenizer.push_to_hub(
         C.HUB_REPO_ID,
         commit_message=C.HUB_COMMIT_MESSAGE,
@@ -701,58 +628,83 @@ def push_to_hub(fast_tokenizer: PreTrainedTokenizerFast) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. Main
+# 8. Main
 # ─────────────────────────────────────────────────────────────
 
 def main() -> None:
+    wall_start = time.time()
+
     log.info("╔══════════════════════════════════════╗")
     log.info("║   MathFormer Tokenizer Training      ║")
     log.info("╚══════════════════════════════════════╝")
-    log.info(f"Running on Modal volume: {_on_modal}")
-    log.info(f"Train corpus : {CORPUS_TRAIN}")
-    log.info(f"Eval corpus  : {CORPUS_EVAL}")
-    log.info(f"Tokenizer out: {TOK_DIR}")
 
-    # Step 1 — Build corpus files
-    build_corpus_files()
+    # ── Memory guard ─────────────────────────────────────────
+    try:
+        import psutil
+        vm    = psutil.virtual_memory()
+        avail = vm.available / 1024**3
+        total = vm.total     / 1024**3
+        log.info(f"RAM at startup: {avail:.1f}GB available / {total:.1f}GB total")
+        if avail < 4.0:
+            log.error("< 4GB available — high OOM risk. Free memory and retry.")
+            sys.exit(1)
+    except ImportError:
+        log.warning("psutil not installed — skipping memory check. pip install psutil")
 
-    # Step 2 — Build and train tokenizer
-    tokenizer = build_tokenizer()
-    tokenizer = train_tokenizer(tokenizer)
+    # ── HF datasets: never cache to RAM ──────────────────────
+    os.environ["HF_DATASETS_IN_MEMORY_MAX_SIZE"] = "0"
 
-    # Step 3 — Save raw tokenizer JSON
-    tokenizer.save(str(TOK_JSON))
-    log.info(f"Raw tokenizer saved: {TOK_JSON}")
+    log.info(f"Modal volume detected : {_on_modal}")
+    log.info(f"Train corpus path     : {CORPUS_TRAIN}")
+    log.info(f"Eval  corpus path     : {CORPUS_EVAL}")
+    log.info(f"Tokenizer output      : {TOK_DIR}")
+    log.info(f"Train word cap        : {TRAIN_WORD_CAP:,}")
 
-    # Step 4 — Wrap as PreTrainedTokenizerFast
-    fast_tok = wrap_as_fast_tokenizer(tokenizer)
-    fast_tok.save_pretrained(str(TOK_DIR))
-    log.info(f"Fast tokenizer saved: {TOK_DIR}")
+    with timer("Corpus build"):
+        build_corpus_files()
 
-    # Step 5 — Evaluate
-    corpus_res, stress_res = run_full_evaluation(fast_tok)
-    print_results_table(corpus_res, stress_res)
-    save_results(corpus_res, stress_res)
+    with timer("Tokenizer init"):
+        tokenizer = build_tokenizer()
 
-    # Step 6 — Sanity check before push
+    with timer("BPE training"):
+        tokenizer = train_tokenizer(tokenizer)
+
+    _log_memory("post-training")
+
+    with timer("Save tokenizer"):
+        tokenizer.save(str(TOK_JSON))
+        log.info(f"Raw tokenizer JSON → {TOK_JSON}")
+        fast_tok = wrap_as_fast_tokenizer(tokenizer)
+        fast_tok.save_pretrained(str(TOK_DIR))
+        log.info(f"Fast tokenizer     → {TOK_DIR}")
+
+    with timer("Evaluation"):
+        corpus_res, stress_res = run_full_evaluation(fast_tok)
+        print_results_table(corpus_res, stress_res)
+        save_results(corpus_res, stress_res)
+
+    # ── Sanity gates before push ──────────────────────────────
     unk_rate = corpus_res.get("MathFormer", {}).get("unk_rate", 99.0)
     if unk_rate > 0.5:
         log.warning(
-            f"UNK rate is {unk_rate:.2f}% — higher than expected. "
-            f"Review the corpus or increase vocab size before deploying."
+            f"UNK rate {unk_rate:.2f}% exceeds 0.5% threshold. "
+            f"Review corpus or increase vocab size before deploying."
         )
 
-    digit_integrity = stress_res.get("MathFormer", {}).get("digit_integrity_rate", 0.0)
-    if digit_integrity < 100.0:
+    dig = stress_res.get("MathFormer", {}).get("digit_integrity_rate", 0.0)
+    if dig < 100.0:
         log.warning(
-            f"Digit integrity is {digit_integrity:.1f}% (target: 100%). "
-            f"Review the pre-tokeniser regex."
+            f"Digit integrity {dig:.1f}% < 100% target. "
+            f"Review PRETOKENIZER_REGEX in config.py."
         )
 
-    # Step 7 — Push to Hub
-    push_to_hub(fast_tok)
+    with timer("Hub push"):
+        push_to_hub(fast_tok)
 
-    log.info("Done.")
+    total_td = timedelta(seconds=int(time.time() - wall_start))
+    log.info("═" * 50)
+    log.info(f"  Total wall time: {total_td}")
+    log.info("═" * 50)
 
 
 if __name__ == "__main__":
