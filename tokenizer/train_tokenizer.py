@@ -16,6 +16,8 @@ from datetime import timedelta
 from pathlib import Path
 from tqdm import tqdm
 
+import itertools
+
 import sentencepiece as spm
 from datasets import load_dataset
 from tokenizers.decoders import Metaspace
@@ -89,9 +91,12 @@ def build_local_corpus():
             split=C.NEMOTRON_SPLIT, streaming=True, token=HF_TOKEN
         ).skip(C.NEMOTRON_EVAL_ROWS)
 
-        for row in nemotron_ds:
+        # islice caps iteration without breaking mid-stream, avoiding the
+        # PyGILState_Release crash caused by abandoning background fetch threads.
+        # 500k rows is a safe upper bound; word-count logic skips writes once full.
+        for row in itertools.islice(nemotron_ds, 500_000):
             if nemotron_words >= target_per_dataset:
-                break
+                continue
             text = normalize_text(row.get(C.NEMOTRON_TEXT_COL, "") or "")
             if len(text) > 50:
                 words_in_row = len(text.split())
@@ -110,9 +115,9 @@ def build_local_corpus():
             streaming=True, token=HF_TOKEN
         ).skip(C.DEEPMATH_EVAL_ROWS).shuffle(seed=C.RANDOM_SEED, buffer_size=2_000)
 
-        for row in deepmath_ds:
+        for row in itertools.islice(deepmath_ds, 500_000):
             if deepmath_words >= target_per_dataset or word_count >= C.TRAIN_WORD_CAP:
-                break
+                continue
             text = normalize_text(build_deepmath_text(row))
             if len(text) > 50:
                 words_in_row = len(text.split())
@@ -264,11 +269,11 @@ def main():
     # space from tokens that immediately follow a special tag during decode.
     # Switching to "always" means every token that represents a word boundary
     # gets its ▁ faithfully converted back to a space, regardless of position.
-    # add_prefix_space=True on PreTrainedTokenizerFast must match this setting.
+    # Note: add_prefix_space was added to Metaspace in tokenizers>=0.14; we
+    # omit it here for compatibility and set it only on PreTrainedTokenizerFast.
     fast_tokenizer_object.decoder = Metaspace(
         replacement="\u2581",       # ▁
         prepend_scheme="always",
-        add_prefix_space=True,
     )
     # ─────────────────────────────────────────────────────────────────────────
 
