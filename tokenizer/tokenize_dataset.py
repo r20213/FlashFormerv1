@@ -133,8 +133,8 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
                 try:
                     current_map = global_state.to_dict()
                     total_cluster_tokens = sum(v for k, v in current_map.items() if k.startswith("tokens_"))
-                    if total_cluster_tokens >= PRETRAIN_TARGET_TOKENS:
-                        print(f"🛑 [Worker {worker_id}] Global target limit of {PRETRAIN_TARGET_TOKENS:,} tokens detected. Breaking stream.")
+                    if total_cluster_tokens >= C.PRETRAIN_TARGET_TOKENS:
+                        print(f"🛑 [Worker {worker_id}] Global target limit of {C.PRETRAIN_TARGET_TOKENS:,} tokens detected. Breaking stream.")
                         break
                 except Exception:
                     pass
@@ -168,7 +168,7 @@ def main():
     
     print("🚀 Initiating parallel map orchestrator...")
     print(f"📦 Mount Volume: {C.TOKENIZED_DATA_VOLUME}")
-    print(f"📊 Extraction Matrix Target: {PRETRAIN_TARGET_TOKENS:,} total tokens.")
+    print(f"📊 Extraction Matrix Target: {C.PRETRAIN_TARGET_TOKENS:,} total tokens.")
     
     # Clean the centralized memory register cleanly before spawning workers
     global_state.clear()
@@ -201,7 +201,7 @@ def main():
         # Ticking terminal log update
         current_max_tokens = max(live_tokens, total_tokens_accumulated)
         sys.stdout.write(
-            f"\r📈 Global Live Matrix: {current_max_tokens:,} / {PRETRAIN_TARGET_TOKENS:,} tokens | "
+            f"\r📈 Global Live Matrix: {current_max_tokens:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens | "
             f"L4 Docs: {max(live_l4, aggregate_lvl4):,} | L5 Docs: {max(live_l5, aggregate_lvl5):,} | "
             f"⏱️ Runtime: {timedelta(seconds=int(time.time() - t0))} | "
             f"💸 Est. Cost: ${estimated_cost:.2f}"
@@ -209,8 +209,8 @@ def main():
         sys.stdout.flush()
         
         # Main thread catch-all limit breaker
-        if current_max_tokens >= PRETRAIN_TARGET_TOKENS:
-            print(f"\n\n🎯 Target Matrix Limit of {PRETRAIN_TARGET_TOKENS:,} tokens reached successfully!")
+        if current_max_tokens >= C.PRETRAIN_TARGET_TOKENS:
+            print(f"\n\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} tokens reached successfully!")
             break
             
     print("\n🏁 Distributed Processing Phase Finished Cleanly.")
