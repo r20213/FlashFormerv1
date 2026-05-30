@@ -35,7 +35,7 @@ data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=
 @app.function(
     cpu=2.0,
     memory=4096,
-    secret=tokenizer_secret,
+    secrets=[tokenizer_secret],
     volumes={"/data": data_volume},
     timeout=7200
 )
