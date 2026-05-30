@@ -30,8 +30,8 @@ image = (
 app = modal.App("mathformer-distributed-pretrain-pack", image=image)
 data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=True)
 
-# Build a global cluster queue to stream live metrics back home
-token_queue = modal.Queue.from_name("global-token-metrics", create_if_missing=True)
+# FIX: Explicitly bind an ephemeral Queue directly to the app layout
+app.global_metrics_queue = modal.Queue.new()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker Function
@@ -46,15 +46,15 @@ token_queue = modal.Queue.from_name("global-token-metrics", create_if_missing=Tr
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
     Independent parallel worker block. Pipes performance metrics back to the
-    orchestrator in real time using a cluster Queue to prevent local output freezing.
+    orchestrator in real time using the app metric queue layout.
     """
     import numpy as np
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from tqdm import tqdm
     
-    # Connect directly to the shared queue cluster layer
-    q = modal.Queue.from_name("global-token-metrics")
+    # Extract the bound queue resource straight from the active execution context
+    q = app.global_metrics_queue
     
     print(f"👷 [Worker {worker_id}/{num_workers}] Initializing tokenizer layer...")
     tokenizer = AutoTokenizer.from_pretrained(C.HUB_REPO_ID, token=os.environ["HF_TOKEN"])
@@ -118,7 +118,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
                 buffer_ids.clear()
                 f_out.flush()
                 
-                # REAL-TIME UPDATE: Send the newly saved batch data straight to the orchestrator
+                # Send performance pack straight into the app loop structure
                 q.put((delta_tokens, score == 4, score == 5, False))
                 progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
                 
@@ -150,14 +150,10 @@ def main():
     print(f"📦 Mount Volume: {C.TOKENIZED_DATA_VOLUME}")
     print(f"📊 Extraction Matrix Target: {C.PRETRAIN_TARGET_TOKENS:,} total tokens.")
     
-    # Clear out any old residual queue configurations
-    q = modal.Queue.from_name("global-token-metrics")
-    while q.len() > 0:
-        q.get()
-        
+    q = app.global_metrics_queue
     worker_inputs = [(i, NUM_CONCURRENT_WORKERS) for i in range(NUM_CONCURRENT_WORKERS)]
     
-    # Fire off all workers completely asynchronously in the background background
+    # Fire off all workers asynchronously in the background background
     tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False)
     
     total_tokens_accumulated = 0
@@ -170,7 +166,7 @@ def main():
     # Continuous listening thread layout
     while finished_workers < NUM_CONCURRENT_WORKERS:
         try:
-            # Wait up to 5 seconds for any data payload block to hit the queue
+            # Pull metrics directly as they appear from any cloud worker
             delta_tokens, is_l4, is_l5, is_done = q.get(timeout=5)
             
             if is_done:
