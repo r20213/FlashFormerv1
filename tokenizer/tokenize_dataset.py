@@ -141,6 +141,9 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
 # ─────────────────────────────────────────────────────────────────────────────
 # Local Orchestration Coordinator
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Local Orchestration Coordinator
+# ─────────────────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
 def main():
     t0 = time.time()
@@ -151,17 +154,18 @@ def main():
     print(f"📊 Extraction Matrix Target: {C.PRETRAIN_TARGET_TOKENS:,} total tokens.")
     
     q = app.global_metrics_queue
-    worker_inputs = [(i, NUM_CONCURRENT_WORKERS) for i in range(NUM_CONCURRENT_WORKERS)]
     
-    # Fire off all workers asynchronously in the background background
-    tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False)
+    print("✨ Spawning workers on the cluster map layout...")
+    # FIX: Use .spawn() to force immediate non-lazy background worker execution
+    for i in range(NUM_CONCURRENT_WORKERS):
+        tokenize_dataset_shard.spawn(i, NUM_CONCURRENT_WORKERS)
     
     total_tokens_accumulated = 0
     aggregate_lvl4 = 0
     aggregate_lvl5 = 0
     finished_workers = 0
     
-    print("✨ Workers deployed to cluster. Listening for stream data packets...\n")
+    print("🛰️ All workers activated. Listening for live token stream packets...\n")
     
     # Continuous listening thread layout
     while finished_workers < NUM_CONCURRENT_WORKERS:
