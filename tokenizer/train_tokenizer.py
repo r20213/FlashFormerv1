@@ -134,14 +134,12 @@ def main():
     # Run data extraction step
     build_local_corpus()
 
-    log.info("⚙️ Compiling custom structural and mathematical control tokens...")
+    log.info("⚙️ Compiling custom user-defined structural and mathematical tokens...")
     
-    # Structural boundaries must be control symbols to preserve spacing!
-    control_tokens = ["<think>", "</think>", "<answer>", "</answer>", "<|source|>", "<|step|>"]
-    
-    # Any other raw math symbols go here
+    # Combine all special tokens (including your think/answer tags) into user_defined_symbols
     base_specials = {C.UNK_TOKEN, C.BOS_TOKEN, C.EOS_TOKEN, C.PAD_TOKEN}
-    user_symbols = [t for t in C.SPECIAL_TOKENS if t not in base_specials and t not in control_tokens]
+    user_symbols = [t for t in C.SPECIAL_TOKENS if t not in base_specials]
+    
     if hasattr(C, 'ADDITIONAL_MATH_SYMBOLS'):
         user_symbols.extend(C.ADDITIONAL_MATH_SYMBOLS)
     user_symbols = list(dict.fromkeys(user_symbols))
@@ -156,11 +154,7 @@ def main():
         normalization_rule_name="nfkc",
         max_sentencepiece_length=16,
         split_digits=True,
-        
-        # ─── THE CONTROL TOKEN SWAP ───
-        control_symbols=",".join(control_tokens),      # 👈 Keeps spacing around tags intact!
-        user_defined_symbols=",".join(user_symbols),  # For raw math strings/symbols
-        
+        user_defined_symbols=",".join(user_symbols),
         unk_id=0,
         bos_id=1,
         eos_id=2,
@@ -170,9 +164,13 @@ def main():
         eos_piece=C.EOS_TOKEN,
         pad_piece=C.PAD_TOKEN,
         character_coverage=1.0,
-        max_sentence_length=100000,
+        max_sentence_length=500000,
         hard_vocab_limit=False,
-        byte_fallback=False
+        byte_fallback=False,
+        
+        # ─── YOUR WORKING WHITESPACE PRESERVATION ARGS ───
+        split_by_whitespace=False,
+        remove_extra_whitespaces=False
     )
     log.info("✓ Native SentencePiece training cycle complete.")
 
@@ -196,7 +194,7 @@ def main():
         model_max_length=4096, padding_side="right"
     )
     
-    # Re-apply additional structural tokens into the Fast model layer configuration
+    # Re-apply all additional structural tokens into the Fast model layer configuration
     fast_tok.add_special_tokens({"additional_special_tokens": user_symbols})
 
     # Save target JSON and configuration metadata assets
@@ -207,7 +205,7 @@ def main():
     log.info(f"🚀 Pushing final assets to Hub: {C.HUB_REPO_ID}")
     fast_tok.push_to_hub(
         C.HUB_REPO_ID,
-        commit_message="Deploy native SentencePiece-backed 16K Unigram tokenizer.",
+        commit_message="Deploy native SentencePiece-backed 16K Unigram tokenizer with verified space preservation.",
         token=HF_TOKEN,
         private=False
     )
