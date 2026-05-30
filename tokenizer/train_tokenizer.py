@@ -134,29 +134,33 @@ def main():
     # Run data extraction step
     build_local_corpus()
 
-    log.info("⚙️ Compiling custom user-defined mathematical tokens...")
+    log.info("⚙️ Compiling custom structural and mathematical control tokens...")
     
-    # Exclude basic architectural tokens from user_defined_symbols to let SPM treat them as control tokens
+    # Structural boundaries must be control symbols to preserve spacing!
+    control_tokens = ["<think>", "</think>", "<answer>", "</answer>", "<|source|>", "<|step|>"]
+    
+    # Any other raw math symbols go here
     base_specials = {C.UNK_TOKEN, C.BOS_TOKEN, C.EOS_TOKEN, C.PAD_TOKEN}
-    user_symbols = [t for t in C.SPECIAL_TOKENS if t not in base_specials]
-    
-    # Append any extra tokens if defined in your configuration
+    user_symbols = [t for t in C.SPECIAL_TOKENS if t not in base_specials and t not in control_tokens]
     if hasattr(C, 'ADDITIONAL_MATH_SYMBOLS'):
         user_symbols.extend(C.ADDITIONAL_MATH_SYMBOLS)
     user_symbols = list(dict.fromkeys(user_symbols))
 
     log.info(f"🔨 Launching Native C++ SentencePiece Unigram Trainer...")
     
-    # Run core training layout directly on the C++ implementation
     spm.SentencePieceTrainer.train(
         input=str(TMP_CORPUS_FILE),
         model_prefix=SPM_MODEL_PREFIX,
         vocab_size=C.VOCAB_SIZE,
         model_type="unigram",
-        normalization_rule_name="nfkc",         # Fixed mapping parameter
-        max_sentencepiece_length=16,            # Limits maximum length of structural tokens
-        split_digits=True,                      # Forces number fracturing ('4', '2' instead of '42')
-        user_defined_symbols=",".join(user_symbols), # Forces structural tokens to remain unbroken
+        normalization_rule_name="nfkc",
+        max_sentencepiece_length=16,
+        split_digits=True,
+        
+        # ─── THE CONTROL TOKEN SWAP ───
+        control_symbols=",".join(control_tokens),      # 👈 Keeps spacing around tags intact!
+        user_defined_symbols=",".join(user_symbols),  # For raw math strings/symbols
+        
         unk_id=0,
         bos_id=1,
         eos_id=2,
@@ -165,12 +169,10 @@ def main():
         bos_piece=C.BOS_TOKEN,
         eos_piece=C.EOS_TOKEN,
         pad_piece=C.PAD_TOKEN,
-        character_coverage=1.0,                 # Ensures no math symbol is dropped as an outlier
-        max_sentence_length=100000,             # 👈 Stops skipping long math blocks
-        hard_vocab_limit=False,                 # 👈 Prevents crash if pool under-runs
-        byte_fallback=False,
-        split_by_whitespace=False,              # Stops pre-chopping strings at spaces
-        remove_extra_whitespaces=False,
+        character_coverage=1.0,
+        max_sentence_length=100000,
+        hard_vocab_limit=False,
+        byte_fallback=False
     )
     log.info("✓ Native SentencePiece training cycle complete.")
 
