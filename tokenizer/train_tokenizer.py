@@ -6,23 +6,25 @@ then executes a native C++ SentencePiece Unigram training iteration.
 Converts the final asset to a Transformers Fast Tokenizer for Hugging Face deployment.
 """
 
+import itertools
+import logging
 import os
 import re
 import sys
 import time
 import unicodedata
-import logging
 from datetime import timedelta
 from pathlib import Path
-from tqdm import tqdm
 
-import itertools
+from tqdm import tqdm
 
 import sentencepiece as spm
 from datasets import load_dataset
-from tokenizers.decoders import Metaspace
+from tokenizers import AddedToken, Tokenizer
+from tokenizers.decoders import Metaspace as MetaspaceDecoder
+from tokenizers.models import Unigram
+from tokenizers.pre_tokenizers import Metaspace as MetaspacePreTokenizer
 from transformers import PreTrainedTokenizerFast
-from transformers.convert_slow_tokenizer import SpmConverter
 
 import config as C
 
@@ -68,7 +70,6 @@ def build_deepmath_text(row: dict) -> str:
     question = row.get("question", "") or ""
     thought = row.get("r1_solution_1", "") or ""
     output = row.get("final_answer", "") or ""
-
     return f"Question: {question}\nThought: {thought}\nFinal Answer: {output}"
 
 def build_local_corpus():
@@ -93,7 +94,6 @@ def build_local_corpus():
 
         # islice caps iteration without breaking mid-stream, avoiding the
         # PyGILState_Release crash caused by abandoning background fetch threads.
-        # 500k rows is a safe upper bound; word-count logic skips writes once full.
         for row in itertools.islice(nemotron_ds, 500_000):
             if nemotron_words >= target_per_dataset:
                 continue
@@ -102,7 +102,6 @@ def build_local_corpus():
                 words_in_row = len(text.split())
                 nemotron_words += words_in_row
                 word_count += words_in_row
-
                 cleaned_line = text.replace("\n", " ")
                 f.write(cleaned_line + "\n")
                 pbar.update(words_in_row)
@@ -123,7 +122,6 @@ def build_local_corpus():
                 words_in_row = len(text.split())
                 deepmath_words += words_in_row
                 word_count += words_in_row
-
                 cleaned_line = text.replace("\n", " ")
                 f.write(cleaned_line + "\n")
                 pbar.update(words_in_row)
@@ -135,45 +133,35 @@ def build_local_corpus():
 # 3. Validation Gate — hard abort before any push
 # ─────────────────────────────────────────────────────────────
 VALIDATION_CASES = [
-    # Core case from original failing test
     (
         "<think> Let the sequence be x_n = 42 + \\alpha \\cdot \\sum_{i=1}^n \\frac{1}{i^2}. "
         "Therefore, 42 is an upper bound. </think> <answer> The limit converges to 42. </answer>"
     ),
-    # Space before closing tag only
     "<think> base case: n = 1. </think> <answer> Q.E.D. </answer>",
-    # Inter-tag space preserved
     "<think> step 1. </think> <answer> done. </answer>",
-    # Empty tag bodies — degenerate edge case
     "<think> </think> <answer> </answer>",
-    # No tags — plain math must still survive
     "No tags, plain math: \\frac{1}{2} + \\sum_{i=1}^{n} i^2 = 42.",
-    # Digits must still split
     "<think> x = 123 + 456. </think> <answer> 579. </answer>",
 ]
 
 def validate_roundtrip(tokenizer: PreTrainedTokenizerFast) -> None:
-    """
-    Hard abort if any test case fails lossless round-trip.
-    Prevents deploying a broken tokenizer after GPU-expensive training.
-    """
+    """Hard abort if any test case fails lossless round-trip."""
     failures = []
     for text in VALIDATION_CASES:
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=False)
         if decoded != text:
-            # Find first differing position for a tight diff readout
             min_len = min(len(text), len(decoded))
             diff_pos = next(
                 (i for i in range(min_len) if text[i] != decoded[i]),
-                min_len  # they match up to min_len, so length diverges
+                min_len
             )
             failures.append({
-                "input":   text,
-                "decoded": decoded,
-                "diff_at": diff_pos,
-                "char_in": repr(text[diff_pos]) if diff_pos < len(text) else "<missing>",
-                "char_out": repr(decoded[diff_pos]) if diff_pos < len(decoded) else "<missing>",
+                "input":    text,
+                "decoded":  decoded,
+                "diff_at":  diff_pos,
+                "char_in":  repr(text[diff_pos])    if diff_pos < len(text)    else "<missing>",
+                "char_out": repr(decoded[diff_pos])  if diff_pos < len(decoded) else "<missing>",
             })
 
     if failures:
@@ -193,12 +181,56 @@ def validate_roundtrip(tokenizer: PreTrainedTokenizerFast) -> None:
     log.info(f"✓ All {len(VALIDATION_CASES)} round-trip validation cases passed.")
 
 # ─────────────────────────────────────────────────────────────
-# 4. Stage 2: Train Native SentencePiece & Convert
+# 4. Build HF Fast Tokenizer directly from SPM vocab
+#    (bypasses SpmConverter, which hard-codes prepend_scheme="first"
+#     in its Rust layer and silently ignores post-hoc decoder assignment)
+# ─────────────────────────────────────────────────────────────
+def build_fast_tokenizer(spm_model_path: str, special_tokens: list[str]) -> Tokenizer:
+    """
+    Reads the SPM vocab directly and constructs a tokenizers.Tokenizer with
+    a Metaspace decoder locked to prepend_scheme='always'.  This is the only
+    way to guarantee the decoder setting is respected in older tokenizers builds
+    where SpmConverter's internal Rust construction overwrites any Python-side
+    decoder assignment.
+    """
+    sp = spm.SentencePieceProcessor()
+    sp.load(spm_model_path)
+
+    # Extract full vocab as (piece, score) pairs — preserves exact SPM ordering
+    vocab = [(sp.id_to_piece(i), sp.get_score(i)) for i in range(sp.get_piece_size())]
+
+    # Build the Unigram model directly
+    tokenizer = Tokenizer(Unigram(vocab, unk_id=0))
+
+    # Pre-tokenizer: split on whitespace and prepend ▁ — matches SPM behaviour
+    tokenizer.pre_tokenizer = MetaspacePreTokenizer(
+        replacement="\u2581",       # ▁  (U+2581)
+        prepend_scheme="always",    # every token at a word boundary gets ▁
+        split=True,
+    )
+
+    # Decoder: inverse of pre-tokenizer — prepend_scheme='always' is what
+    # restores spaces before closing tags and between adjacent special tokens.
+    tokenizer.decoder = MetaspaceDecoder(
+        replacement="\u2581",
+        prepend_scheme="always",
+    )
+
+    # Register all special tokens so they are never split by the pre-tokenizer
+    added = [
+        AddedToken(tok, single_word=False, lstrip=False, rstrip=False, normalized=False)
+        for tok in special_tokens
+    ]
+    tokenizer.add_special_tokens(added)
+
+    return tokenizer
+
+# ─────────────────────────────────────────────────────────────
+# 5. Stage 2: Train Native SentencePiece & Convert
 # ─────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
 
-    # Run data extraction step
     build_local_corpus()
 
     log.info("⚙️ Compiling custom user-defined structural and mathematical tokens...")
@@ -209,22 +241,16 @@ def main():
     if hasattr(C, "ADDITIONAL_MATH_SYMBOLS"):
         user_symbols.extend(C.ADDITIONAL_MATH_SYMBOLS)
 
-    # ── FIX B ────────────────────────────────────────────────────────────────
-    # For every closing tag (e.g. </think>), register a ▁-prefixed variant so
-    # SentencePiece learns that "▁</think>" is a valid atomic piece.  This
-    # prevents the Unigram encoder from fragmenting the leading space away from
-    # the tag boundary, which is what caused the round-trip failure.
-    # The actual ▁ character (U+2581) is what SentencePiece uses internally to
-    # represent a leading space — using a plain ASCII space here would not work.
+    # FIX B: register ▁-prefixed closing-tag variants so SPM encodes
+    # "▁</think>" as one atomic piece rather than fragmenting the space.
     closing_tag_variants = [
-        f"\u2581{tok}"          # ▁ + closing tag
+        f"\u2581{tok}"
         for tok in user_symbols
         if tok.startswith("</")
     ]
     user_symbols = list(dict.fromkeys(user_symbols + closing_tag_variants))
-    # ─────────────────────────────────────────────────────────────────────────
 
-    log.info(f"🔨 Launching Native C++ SentencePiece Unigram Trainer...")
+    log.info("🔨 Launching Native C++ SentencePiece Unigram Trainer...")
 
     spm.SentencePieceTrainer.train(
         input=str(TMP_CORPUS_FILE),
@@ -253,29 +279,17 @@ def main():
     log.info("✓ Native SentencePiece training cycle complete.")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 5. In-Memory Direct Conversion to Hugging Face Fast Architecture
+    # FIX C (proper): build tokenizer directly — skip SpmConverter entirely.
+    # SpmConverter's Rust construction hard-codes prepend_scheme="first" at the
+    # C++ layer; any Python-side .decoder = ... assignment is silently dropped.
     # ─────────────────────────────────────────────────────────────────────────
-    log.info("⚡ Converting native .model file to Fast Rust Tokenizer instance...")
+    log.info("⚡ Building Fast Tokenizer directly from SPM vocab (bypassing SpmConverter)...")
 
-    sp_processor = spm.SentencePieceProcessor()
-    sp_processor.load(f"{SPM_MODEL_PREFIX}.model")
-    sp_processor.vocab_file = f"{SPM_MODEL_PREFIX}.model"
-
-    converter = SpmConverter(sp_processor)
-    fast_tokenizer_object = converter.converted()
-
-    # ── FIX C ────────────────────────────────────────────────────────────────
-    # SpmConverter hard-codes prepend_scheme="first", which strips the leading
-    # space from tokens that immediately follow a special tag during decode.
-    # Switching to "always" means every token that represents a word boundary
-    # gets its ▁ faithfully converted back to a space, regardless of position.
-    # Note: add_prefix_space was added to Metaspace in tokenizers>=0.14; we
-    # omit it here for compatibility and set it only on PreTrainedTokenizerFast.
-    fast_tokenizer_object.decoder = Metaspace(
-        replacement="\u2581",       # ▁
-        prepend_scheme="always",
+    all_special_tokens = list(base_specials) + user_symbols
+    fast_tokenizer_object = build_fast_tokenizer(
+        spm_model_path=f"{SPM_MODEL_PREFIX}.model",
+        special_tokens=all_special_tokens,
     )
-    # ─────────────────────────────────────────────────────────────────────────
 
     fast_tok = PreTrainedTokenizerFast(
         tokenizer_object=fast_tokenizer_object,
@@ -285,15 +299,12 @@ def main():
         pad_token=C.PAD_TOKEN,
         model_max_length=4096,
         padding_side="right",
-        add_prefix_space=True,      # must match Metaspace decoder above
+        add_prefix_space=True,
     )
 
-    # ── VALIDATION GATE ───────────────────────────────────────────────────────
     # Hard abort before save or push if any round-trip fails.
-    # Catches regressions from future changes to special tokens or SPM params.
     log.info("🧪 Running round-trip validation gate...")
     validate_roundtrip(fast_tok)
-    # ─────────────────────────────────────────────────────────────────────────
 
     fast_tok.save_pretrained(str(OUTPUT_DIR))
     log.info(f"💾 Converted fast configuration assets saved to: {OUTPUT_DIR}")
@@ -306,7 +317,7 @@ def main():
         private=False,
     )
 
-    # Cleanup temporary workspace files
+    # Cleanup
     if TMP_CORPUS_FILE.exists():
         os.remove(TMP_CORPUS_FILE)
     for ext in [".model", ".vocab"]:
