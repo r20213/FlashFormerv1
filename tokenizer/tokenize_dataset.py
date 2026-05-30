@@ -22,7 +22,6 @@ except Exception as e:
 # Define hardware cluster parameters matching your exact operational spec
 image = (
     modal.Image.debian_slim()
-    # Added tqdm explicitly to the cloud environment mapping
     .pip_install("transformers", "tokenizers", "numpy", "datasets", "fsspec", "tqdm")
     .env({"TOKENIZERS_PARALLELISM": "false"})
     .add_local_python_source("config")
@@ -43,44 +42,46 @@ data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=
 )
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
-    Independent parallel worker block. Uses native HF dataset sharding to achieve 
-    guaranteed mathematically isolated row spaces (no double processing).
-    Tracks real-time progress using cloud-optimized tqdm parameters.
+    Independent parallel worker block. Uses a lightweight stream generator filter 
+    to guarantee zero row collisions based purely on explicit worker_id index mapping.
     """
     import numpy as np
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from tqdm import tqdm
-    import random
     
     print(f"👷 [Worker {worker_id}/{num_workers}] Initializing tokenizer layer...")
     tokenizer = AutoTokenizer.from_pretrained(C.HUB_REPO_ID, token=os.environ["HF_TOKEN"])
     
-    print(f"🎯 [Worker {worker_id}/{num_workers}] Binding to unique server-side stream split...")
-    # .shard() ensures worker strictly downloads its 1/N partition over the network
-    dataset = load_dataset(
+    print(f"🎯 [Worker {worker_id}/{num_workers}] Connecting to global data stream...")
+    raw_stream = load_dataset(
         C.NEMOTRON_DATASET,
         name=C.NEMOTRON_SUBSET,
         split=C.NEMOTRON_SPLIT,
         streaming=True,
         token=os.environ["HF_TOKEN"]
-    ).shard(num_shards=num_workers, index=worker_id)
+    )
     
-    random.seed(42 + worker_id)
-    LVL4_KEEP_PROB = 0.14
+    # Mathematical isolation: Brings back the explicit worker id identity check
+    def worker_isolated_stream(iterable):
+        for idx, element in enumerate(iterable):
+            if idx % num_workers == worker_id:
+                yield element
+
+    dataset = worker_isolated_stream(raw_stream)
     shard_file_path = f"/data/tokens_shard_{worker_id}.bin"
     
     tokens_saved_count = 0
     lvl4_processed = 0
     lvl5_processed = 0
     buffer_ids = []
-    FLUSH_THRESHOLD = 500_000 # Memory-flush gate to balance disk I/O
+    FLUSH_THRESHOLD = 500_000 
     
-    # Wrap stream with a cloud-safe tqdm configuration to prevent log-flooding
+    # Wrap our generator split inside tqdm for remote app container logs monitoring
     progress_bar = tqdm(
         dataset,
         desc=f"👷 Shard {worker_id}",
-        mininterval=15.0,  # Limits log updates to once every 15 seconds
+        mininterval=15.0,  # Limits cloud log updates to once every 15 seconds
         unit=" rows"
     )
     
@@ -89,10 +90,8 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             metadata = row.get("metadata", {})
             score = metadata.get("finemath_int_scores", 0)
             
-            # Balance Level 4 and Level 5 rows on the fly
+            # Direct tracking of educational quality levels (no keep probabilities)
             if score == 4:
-                if random.random() > LVL4_KEEP_PROB:
-                    continue
                 lvl4_processed += 1
             elif score == 5:
                 lvl5_processed += 1
@@ -114,7 +113,6 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
                 buffer_ids.clear()
                 f_out.flush()
                 
-                # Update progress bar metrics on every disk-flush sequence
                 progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
                 
         # Final residual cache sweep
@@ -126,7 +124,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             
     print(f"💾 [Worker {worker_id}] Tokenization completed. Saved: {tokens_saved_count:,} tokens.")
     
-    # Explicitly commit files to the Modal Network Volume
+    # Commit files cleanly to the Modal Network Volume
     data_volume.commit()
     
     return tokens_saved_count, lvl4_processed, lvl5_processed
@@ -149,13 +147,12 @@ def main():
     aggregate_lvl4 = 0
     aggregate_lvl5 = 0
     
-    # Gather tracking metrics from workers dynamically as they complete
+    # Gather execution tracking from all workers dynamically as they drop payloads
     for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False):
         total_tokens_accumulated += partial_count
         aggregate_lvl4 += l4
         aggregate_lvl5 += l5
         
-        # Incremental terminal output tracking whenever a shard drops its data payload
         print(f"📈 Global Accumulation Matrix: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens.")
         
         if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
@@ -164,6 +161,7 @@ def main():
             
     print("\n🏁 Distributed Processing Phase Finished.")
     print(f"📊 Aggregate Processed Corpus Capacity: {total_tokens_accumulated:,} tokens.")
-    print(f"📈 Total Balanced Level 4 Documents: {aggregate_lvl4:,}")
-    print(f"📈 Total Balanced Level 5 Documents: {aggregate_lvl5:,}")
+    print(f"📈 Total Level 4 Documents Processed: {aggregate_lvl4:,}")
+    print(f"📈 Total Level 5 Documents Processed: {aggregate_lvl5:,}")
     print(f"⏱️ Matrix Run Duration: {timedelta(seconds=int(time.time() - t0))}")
+
