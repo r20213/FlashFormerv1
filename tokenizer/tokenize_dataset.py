@@ -30,6 +30,9 @@ image = (
 app = modal.App("mathformer-distributed-pretrain-pack", image=image)
 data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=True)
 
+# Build a global cluster queue to stream live metrics back home
+token_queue = modal.Queue.from_name("global-token-metrics", create_if_missing=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker Function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,18 +45,20 @@ data_volume = modal.Volume.from_name(C.TOKENIZED_DATA_VOLUME, create_if_missing=
 )
 def tokenize_dataset_shard(worker_id: int, num_workers: int):
     """
-    Independent parallel worker block. Uses a lightweight stream generator filter 
-    to guarantee zero row collisions based purely on explicit worker_id index mapping.
+    Independent parallel worker block. Pipes performance metrics back to the
+    orchestrator in real time using a cluster Queue to prevent local output freezing.
     """
     import numpy as np
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from tqdm import tqdm
     
+    # Connect directly to the shared queue cluster layer
+    q = modal.Queue.from_name("global-token-metrics")
+    
     print(f"👷 [Worker {worker_id}/{num_workers}] Initializing tokenizer layer...")
     tokenizer = AutoTokenizer.from_pretrained(C.HUB_REPO_ID, token=os.environ["HF_TOKEN"])
     
-    print(f"🎯 [Worker {worker_id}/{num_workers}] Connecting to global data stream...")
     raw_stream = load_dataset(
         C.NEMOTRON_DATASET,
         name=C.NEMOTRON_SUBSET,
@@ -62,7 +67,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
         token=os.environ["HF_TOKEN"]
     )
     
-    # Mathematical isolation: Brings back the explicit worker id identity check
+    # Strict index extraction isolation
     def worker_isolated_stream(iterable):
         for idx, element in enumerate(iterable):
             if idx % num_workers == worker_id:
@@ -77,11 +82,10 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     buffer_ids = []
     FLUSH_THRESHOLD = 500_000 
     
-    # Wrap our generator split inside tqdm for remote app container logs monitoring
     progress_bar = tqdm(
         dataset,
         desc=f"👷 Shard {worker_id}",
-        mininterval=15.0,  # Limits cloud log updates to once every 15 seconds
+        mininterval=15.0,
         unit=" rows"
     )
     
@@ -90,7 +94,6 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             metadata = row.get("metadata", {})
             score = metadata.get("finemath_int_scores", 0)
             
-            # Direct tracking of educational quality levels (no keep probabilities)
             if score == 4:
                 lvl4_processed += 1
             elif score == 5:
@@ -105,29 +108,35 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
             enc = tokenizer(raw_text, add_special_tokens=False)
             buffer_ids.extend(enc["input_ids"])
             
-            # Efficient block-streaming I/O
             if len(buffer_ids) >= FLUSH_THRESHOLD:
                 np_array = np.array(buffer_ids, dtype=np.uint16)
                 f_out.write(np_array.tobytes())
-                tokens_saved_count += len(np_array)
+                
+                # Metrics Package
+                delta_tokens = len(np_array)
+                tokens_saved_count += delta_tokens
                 buffer_ids.clear()
                 f_out.flush()
                 
+                # REAL-TIME UPDATE: Send the newly saved batch data straight to the orchestrator
+                q.put((delta_tokens, score == 4, score == 5, False))
                 progress_bar.set_postfix({"tokens": f"{tokens_saved_count:,}"})
                 
         # Final residual cache sweep
         if buffer_ids:
             np_array = np.array(buffer_ids, dtype=np.uint16)
             f_out.write(np_array.tobytes())
-            tokens_saved_count += len(np_array)
+            delta_tokens = len(np_array)
+            tokens_saved_count += delta_tokens
             buffer_ids.clear()
+            q.put((delta_tokens, False, False, False))
             
     print(f"💾 [Worker {worker_id}] Tokenization completed. Saved: {tokens_saved_count:,} tokens.")
-    
-    # Commit files cleanly to the Modal Network Volume
     data_volume.commit()
     
-    return tokens_saved_count, lvl4_processed, lvl5_processed
+    # Notify main thread that this worker is completely done
+    q.put((0, 0, 0, True))
+    return tokens_saved_count
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local Orchestration Coordinator
@@ -141,27 +150,48 @@ def main():
     print(f"📦 Mount Volume: {C.TOKENIZED_DATA_VOLUME}")
     print(f"📊 Extraction Matrix Target: {C.PRETRAIN_TARGET_TOKENS:,} total tokens.")
     
+    # Clear out any old residual queue configurations
+    q = modal.Queue.from_name("global-token-metrics")
+    while q.len() > 0:
+        q.get()
+        
     worker_inputs = [(i, NUM_CONCURRENT_WORKERS) for i in range(NUM_CONCURRENT_WORKERS)]
+    
+    # Fire off all workers completely asynchronously in the background background
+    tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False)
     
     total_tokens_accumulated = 0
     aggregate_lvl4 = 0
     aggregate_lvl5 = 0
+    finished_workers = 0
     
-    # Gather execution tracking from all workers dynamically as they drop payloads
-    for partial_count, l4, l5 in tokenize_dataset_shard.starmap(worker_inputs, order_outputs=False):
-        total_tokens_accumulated += partial_count
-        aggregate_lvl4 += l4
-        aggregate_lvl5 += l5
-        
-        print(f"📈 Global Accumulation Matrix: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens.")
-        
-        if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
-            print(f"\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} reached.")
-            break
+    print("✨ Workers deployed to cluster. Listening for stream data packets...\n")
+    
+    # Continuous listening thread layout
+    while finished_workers < NUM_CONCURRENT_WORKERS:
+        try:
+            # Wait up to 5 seconds for any data payload block to hit the queue
+            delta_tokens, is_l4, is_l5, is_done = q.get(timeout=5)
+            
+            if is_done:
+                finished_workers += 1
+                continue
+                
+            total_tokens_accumulated += delta_tokens
+            if is_l4: aggregate_lvl4 += 1
+            if is_l5: aggregate_lvl5 += 1
+            
+            # Print feedback instantly the second ANY worker flushes data!
+            print(f"📈 Global Counter: {total_tokens_accumulated:,} / {C.PRETRAIN_TARGET_TOKENS:,} tokens | Active Workers: {NUM_CONCURRENT_WORKERS - finished_workers}/100")
+            
+            if total_tokens_accumulated >= C.PRETRAIN_TARGET_TOKENS:
+                print(f"\n🎯 Target Matrix Limit of {C.PRETRAIN_TARGET_TOKENS:,} successfully reached!")
+                break
+                
+        except Exception:
+            # Keep loop alive if queue is momentarily empty
+            continue
             
     print("\n🏁 Distributed Processing Phase Finished.")
     print(f"📊 Aggregate Processed Corpus Capacity: {total_tokens_accumulated:,} tokens.")
-    print(f"📈 Total Level 4 Documents Processed: {aggregate_lvl4:,}")
-    print(f"📈 Total Level 5 Documents Processed: {aggregate_lvl5:,}")
     print(f"⏱️ Matrix Run Duration: {timedelta(seconds=int(time.time() - t0))}")
-
