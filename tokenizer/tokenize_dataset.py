@@ -82,7 +82,7 @@ def tokenize_dataset_shard(worker_id: int, num_workers: int):
     buffer_ids = []
     
     # Keeping threshold at 500k to simulate true production memory conditions
-    FLUSH_THRESHOLD = 500_000 
+    FLUSH_THRESHOLD = 1_000 
     
     progress_bar = tqdm(
         dataset,
