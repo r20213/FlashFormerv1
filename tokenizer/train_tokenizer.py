@@ -58,41 +58,78 @@ def normalize_text(text: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # 2. Stage 1: Write Normalized Raw Text to Disk
 # ─────────────────────────────────────────────────────────────
+def build_deepmath_text(row: dict) -> str:
+    """
+    Extracts and maps a DeepMath row into a structured sequence string.
+    Ensures question, reasoning steps, and final answers are bound together.
+    """
+    question = row.get("question", "") or ""
+    thought = row.get("r1_solution_1", "") or ""
+    output = row.get("final_answer", "") or ""
+    
+    # Pack the components together into a single structured block
+    # Modify the markers below if you use specific custom tokens (e.g., <|thought|>)
+    return f"Question: {question}\nThought: {thought}\nFinal Answer: {output}"
+
 def build_local_corpus():
     if TMP_CORPUS_FILE.exists():
         log.info(f"💾 Found existing normalized corpus file at {TMP_CORPUS_FILE}. Skipping extraction.")
         return
 
-    log.info(f"📝 Creating flat normalized corpus file: {TMP_CORPUS_FILE}")
+    log.info(f"📝 Creating a balanced, normalized corpus file: {TMP_CORPUS_FILE}")
     word_count = 0
-    estimated_total_lines = C.TRAIN_WORD_CAP // 150  # rough proxy for pbar
     
-    ds = load_dataset(
-        C.NEMOTRON_DATASET, C.NEMOTRON_SUBSET,
-        split=C.NEMOTRON_SPLIT, streaming=True, token=HF_TOKEN
-    ).skip(C.NEMOTRON_EVAL_ROWS)
-
-    pbar = tqdm(total=C.TRAIN_WORD_CAP, desc="✍️ Writing normalized lines to disk", unit="word")
+    # Split the word cap evenly between both datasets to get a balanced distribution
+    target_per_dataset = C.TRAIN_WORD_CAP // 2
+    
+    pbar = tqdm(total=C.TRAIN_WORD_CAP, desc="✍️ Writing balanced lines to disk", unit="word")
 
     with open(TMP_CORPUS_FILE, "w", encoding="utf-8") as f:
-        for row in ds:
-            if word_count >= C.TRAIN_WORD_CAP:
+        # ─── STREAM 1: NEMOTRON ───
+        log.info(f"🧬 Extracting up to {target_per_dataset:,} words from Nemotron...")
+        nemotron_words = 0
+        nemotron_ds = load_dataset(
+            C.NEMOTRON_DATASET, C.NEMOTRON_SUBSET,
+            split=C.NEMOTRON_SPLIT, streaming=True, token=HF_TOKEN
+        ).skip(C.NEMOTRON_EVAL_ROWS)
+
+        for row in nemotron_ds:
+            if nemotron_words >= target_per_dataset:
                 break
-            
             text = normalize_text(row.get(C.NEMOTRON_TEXT_COL, "") or "")
             if len(text) > 50:
                 words_in_row = len(text.split())
+                nemotron_words += words_in_row
                 word_count += words_in_row
                 
-                # Write each text block separated by a newline
-                # Replace internal single newlines with spaces if you want line-by-line training
                 cleaned_line = text.replace("\n", " ")
                 f.write(cleaned_line + "\n")
+                pbar.update(words_in_row)
+
+        # ─── STREAM 2: DEEPMATH ───
+        log.info(f"🧬 Extracting up to {target_per_dataset:,} words from DeepMath...")
+        deepmath_words = 0
+        deepmath_ds = load_dataset(
+            C.DEEPMATH_DATASET, split=C.DEEPMATH_SPLIT,
+            streaming=True, token=HF_TOKEN
+        ).skip(C.DEEPMATH_EVAL_ROWS).shuffle(seed=C.RANDOM_SEED, buffer_size=2_000)
+
+        for row in deepmath_ds:
+            if deepmath_words >= target_per_dataset or word_count >= C.TRAIN_WORD_CAP:
+                break
+            # Reconstruct the question/thought/output block structure natively
+            text = normalize_text(build_deepmath_text(row))
+            if len(text) > 50:
+                words_in_row = len(text.split())
+                deepmath_words += words_in_row
+                word_count += words_in_row
                 
+                cleaned_line = text.replace("\n", " ")
+                f.write(cleaned_line + "\n")
                 pbar.update(words_in_row)
                 
     pbar.close()
-    log.info(f"✓ Local cache successfully prepared. Total words: {word_count:,}")
+    log.info(f"✓ Local mixed cache ready. Total balanced words: {word_count:,}")
 
 # ─────────────────────────────────────────────────────────────
 # 3. Stage 2: Train via File References
