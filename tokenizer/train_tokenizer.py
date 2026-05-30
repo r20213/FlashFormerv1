@@ -43,6 +43,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("mathformer")
 
+# 👇 SILENCE THE HTTP/DATASETS CHATTER HERE 👇
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("datasets").setLevel(logging.WARNING)
+logging.getLogger("filelock").setLevel(logging.WARNING)
+
 def _require_env(var: str) -> str:
     val = os.environ.get(var, "").strip()
     if not val:
